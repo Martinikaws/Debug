@@ -1,0 +1,5856 @@
+-- Rivals skin changer (Matcha)
+local t_start = tick()
+
+-- Health: every warning the run prints is also noted, and the run ends with
+-- one line saying whether everything applied, for players to paste back.
+_G.__RSC_PROBLEMS = {}
+local print = (function(realPrint)
+    local PROBLEM = {"error", "Error", "Couldn't", "couldn't", "can't", "not applied", "Not swapped",
+        "Not in the game's", "Skipped", "Left default", "not loaded yet", "still isn't reporting",
+        "slow memory scan", "no longer fits", "isn't a"}
+    return function(...)
+        realPrint(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
+        local msg = table.concat(parts, " ")
+        if not msg:find("^%[RivalsSkinChanger%]") or msg:find("^%[RivalsSkinChanger%] Health:") then return end
+        msg = msg:gsub("^%[RivalsSkinChanger%]%s*", "")
+        local bad = false
+        for _, k in ipairs(PROBLEM) do if msg:find(k, 1, true) then bad = true break end end
+        for got, total in msg:gmatch("applied: (%d+)/(%d+)") do
+            if tonumber(got) < tonumber(total) then bad = true end
+        end
+        if bad then table.insert(_G.__RSC_PROBLEMS, msg) end
+    end
+end)(print)
+
+if not pcall(memory_read, "int", game.Address) then
+    return
+end
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- Rivals only
+local RIVALS_GAME_ID = 6035872082
+local okGameId, gameId = pcall(function() return game.GameId end)
+if not okGameId or tonumber(gameId) ~= RIVALS_GAME_ID then return end
+
+local LP = game:GetService("Players").LocalPlayer
+while not LP do
+    task.wait(0.05)
+    LP = game:GetService("Players").LocalPlayer
+end
+
+if game.GameId ~= 6035872082 then return end
+
+if type(_G.__RIVALS_SKIN_CHANGER_RESTORE) == "function" then
+    pcall(_G.__RIVALS_SKIN_CHANGER_RESTORE)
+end
+_G.__RIVALS_SKIN_CHANGER_RESTORE = nil
+_G.__RIVALS_SKIN_CHANGER_ACTIVE = nil
+
+-- Support ID: a short number for this PC, made here from Matcha's hardware ID
+-- and scrambled so it can't be turned back into it. Nothing is sent anywhere;
+-- it rides along on two of the log lines (as "ref"), so a log or screenshot
+-- says which copy it came from, and the
+-- changer refuses to run for IDs on the list in the rsc-refs repo.
+local function supportId()
+    local ok, hw = pcall(function() return gethwid() end)
+    if not ok or type(hw) ~= "string" or hw == "" then return nil end
+    local s = "rsc:" .. hw
+    local h1, h2 = 7, 11
+    for _ = 1, 3 do
+        for i = 1, #s do
+            local c = s:byte(i)
+            h1 = (h1 * 131 + c + h2 % 251) % 999983
+            h2 = (h2 * 65599 + c * 7 + i + h1 % 509) % 1000003
+        end
+    end
+    return string.format("%04d-%04d", h1 % 10000, h2 % 10000)
+end
+do
+    local BLACKLIST_URL = "https://raw.githubusercontent.com/Martinikaws/rsc-refs/main/list.txt"
+    local id = supportId()
+    _G.__RIVALS_SUPPORT_ID = id
+    if id then
+        -- If the list can't be fetched the changer runs as usual.
+        local okList, list = pcall(function() return game:HttpGet(BLACKLIST_URL) end)
+        if okList and type(list) == "string" then
+            for line in list:gmatch("[^\r\n]+") do
+                -- A listed ID stops here, without a message.
+                if line:match("^%s*(%d%d%d%d%-%d%d%d%d)") == id then return end
+            end
+        end
+    end
+end
+
+-- Run lock
+local RUN_LOCK_SECONDS = 180
+do
+    local busy = _G.__RIVALS_SKIN_CHANGER_BUSY
+    if type(busy) == "number" and tick() - busy < RUN_LOCK_SECONDS then
+        print("[RivalsSkinChanger] Already running - wait for it to finish, then run it again if needed")
+        if typeof(notify) == "function" then
+            pcall(notify, "Already running - wait for it to finish", "Rivals Skin Changer", 5)
+        end
+        return
+    end
+    _G.__RIVALS_SKIN_CHANGER_BUSY = tick()
+end
+
+if typeof(notify) == "function" then pcall(notify, "Starting - applying your skins...", "Rivals Skin Changer", 5) end
+
+-- Game folders
+local psRoot = LP:WaitForChild("PlayerScripts", 30)
+local A = psRoot and psRoot:WaitForChild("Assets", 30)
+if not A then
+    for _, d in ipairs(LP:GetDescendants()) do
+        if d.Name == "Assets" and d.Parent and d.Parent.Name == "PlayerScripts" then A = d break end
+    end
+end
+local vm = A and A:WaitForChild("ViewModels", 30)
+local wf = vm and vm:WaitForChild("Weapons", 30)
+local mi = A and A:WaitForChild("Misc", 10)
+local tf = A and A:FindFirstChild("Throwables")
+local pf = A and A:FindFirstChild("Projectiles")
+local stf = A and A:FindFirstChild("SpearTightropes")
+
+if not wf then
+    _G.__RIVALS_SKIN_CHANGER_BUSY = nil
+    return
+end
+
+local function waitForAssets()
+    local lastWf, lastVm = -1, -1
+    for _ = 1, 20 do
+        local wfCount = #wf:GetChildren()
+        local vmCount = #vm:GetDescendants()
+        if wfCount == lastWf and vmCount == lastVm then break end
+        lastWf, lastVm = wfCount, vmCount
+        task.wait(0.3)
+    end
+end
+waitForAssets()
+
+-- Memory
+local mrd, mwr, pcall, ipairs, pairs = memory_read, memory_write, pcall, ipairs, pairs
+
+local rd = function(a)
+    local o, v = pcall(mrd, "uintptr_t", a)
+    return o and v or nil
+end
+
+local wr = function(a, v)
+    pcall(mwr, "uintptr_t", a, v)
+end
+
+-- Offsets. From the Roblox offsets dump (offsets.imtheo.lol), but only one
+-- made for the Roblox build that is running: the site follows the newest
+-- Roblox, and Matcha users are often a build behind (pinned by a bootstrapper).
+-- A dump fits when its module pointer to the DataModel, which moves with
+-- nearly every build, leads to this game. Every dump is saved under its
+-- Roblox version, so an older build finds its own later; with none that
+-- fits, the numbers after each name are used (Roblox build cec3ad5). The
+-- Instance offsets are then checked on the live game and found by scanning
+-- if they are wrong, and the sky, lighting, sound and name writers check
+-- their fields before writing.
+local dumpOff = (function()
+    local LEGACY_CACHE, CACHE_DIR = "rivals_offsets_cache.json", "rivals_offsets"
+    local URLS = {"https://offsets.imtheo.lol/Offsets.json"}
+    local hs = game:GetService("HttpService")
+    local function decode(raw)
+        if type(raw) ~= "string" or #raw < 200 then return nil end
+        local ok, data = pcall(function() return hs:JSONDecode(raw) end)
+        if ok and type(data) == "table" and type(data.Offsets) == "table" then return data end
+    end
+    local function versionOf(data)
+        return tostring(data["Roblox Version"] or ""):match("^version%-%x+$")
+    end
+    -- The running build, where Matcha can tell it (e.g. "version-cec3ad5889b447cf").
+    local okV, running = pcall(function() return getrbxversion() end)
+    running = okV and type(running) == "string" and running:match("version%-%x+") or nil
+    -- true: the dump is for this build; false: it isn't; nil: can't be told.
+    -- The DataModel pointer is measured in the running game, so it decides
+    -- whenever it can; the reported version only when it can't (no getbase,
+    -- or the dump lacks the pointer).
+    local function fits(data)
+        local f = data.Offsets.FakeDataModel
+        local ptr = type(f) == "table" and tonumber(f.Pointer)
+        local real = type(f) == "table" and tonumber(f.RealDataModel)
+        local okB, base = pcall(function() return getbase() end)
+        local okG, dm = pcall(function() return game.Address end)
+        if ptr and ptr > 0 and real and real > 0 and okB and type(base) == "number" and base >= 0x10000
+            and okG and type(dm) == "number" and dm >= 0x10000 then
+            local fake = rd(base + ptr)
+            return fake ~= nil and fake >= 0x10000 and rd(fake + real) == dm
+        end
+        local v = versionOf(data)
+        if running and v then return v == running end
+        return nil
+    end
+
+    local online
+    for _, url in ipairs(URLS) do
+        local ok, raw = pcall(function() return game:HttpGet(url) end)
+        online = ok and decode(raw) or nil
+        if online then
+            -- Right for its own build, whichever that is.
+            local v = versionOf(online)
+            if v then
+                pcall(makefolder, CACHE_DIR)
+                pcall(writefile, CACHE_DIR .. "/" .. v .. ".json", raw)
+            end
+            break
+        end
+    end
+
+    local data, from, fit
+    if online then
+        fit = fits(online)
+        if fit ~= false then data, from = online, "online" end
+    end
+    if not data then
+        -- A saved dump that fits: one per Roblox version, plus the single
+        -- file earlier versions of the changer kept.
+        local paths = {running and (CACHE_DIR .. "/" .. running .. ".json") or nil}
+        local okL, list = pcall(listfiles, CACHE_DIR)
+        for _, p in ipairs(okL and type(list) == "table" and list or {}) do
+            if tostring(p):lower():find("%.json$") then paths[#paths + 1] = p end
+        end
+        paths[#paths + 1] = LEGACY_CACHE
+        local untested
+        for _, p in ipairs(paths) do
+            local okR, raw = pcall(function() return isfile(p) and readfile(p) or nil end)
+            local saved = okR and decode(raw) or nil
+            if saved then
+                local f = fits(saved)
+                if f == true then data, from, fit = saved, "saved copy", true break end
+                if f == nil and not untested then untested = saved end
+            end
+        end
+        -- The site also keeps each build's own list: fetch the running one's.
+        if not data and running then
+            local ok, raw = pcall(function() return game:HttpGet("https://offsets.imtheo.lol/" .. running .. "/offsets.json") end)
+            local own = ok and decode(raw) or nil
+            if own and versionOf(own) == running and fits(own) ~= false then
+                data, from, fit = own, "online, for this build", fits(own)
+                pcall(makefolder, CACHE_DIR)
+                pcall(writefile, CACHE_DIR .. "/" .. running .. ".json", raw)
+            end
+        end
+        -- No dump online and no way to check: the last saved one, as before.
+        if not data and not online and untested then data, from = untested, "saved copy" end
+    end
+    local dump = data and data.Offsets or {}
+    _G.__RSC_OFFSETS = {from = from or "built-in", version = data and data["Roblox Version"], fits = fit,
+        skipped = online and data ~= online and online["Roblox Version"] or nil}
+    return function(class, field, default)
+        local c = dump[class]
+        local v = type(c) == "table" and tonumber(c[field])
+        if v and v > 0 and v < 0x4000 then return v end
+        return default
+    end
+end)()
+
+local OFF = {
+    Parent = dumpOff("Instance", "Parent", 104),
+    NameContainer = dumpOff("Instance", "NameContainer", 112),
+    Children = dumpOff("Instance", "ChildrenStart", 120),
+    Transparency = dumpOff("BasePart", "Transparency", 288),
+    -- UI frames (the health bar)
+    GuiColor = dumpOff("GuiObject", "BackgroundColor3", 0x530),
+    GuiSize = dumpOff("GuiObject", "Size", 0x520),
+    GuiVisible = dumpOff("GuiObject", "Visible", 0x59d)
+}
+
+local function verifyOffsets()
+    local fixed = {}
+    local function stdString(p)
+        if not p or p < 0x10000 then return nil end
+        local size, cap = rd(p + 16), rd(p + 24)
+        if not size or not cap or size > 200 or cap < size then return nil end
+        local ok, s = pcall(mrd, "string", cap > 15 and rd(p) or p)
+        if ok and type(s) == "string" then return s:sub(1, size) end
+    end
+    local function holdsChild(parent, child, off)
+        local n = rd(parent.Address + off)
+        local b, e = n and n > 0x10000 and rd(n), n and n > 0x10000 and rd(n + 8)
+        if not b or not e or e < b or (e - b) % 16 ~= 0 or e - b > 16 * 65536 then return false end
+        for s = b, math.min(e - 16, b + 16 * 4096), 16 do
+            if rd(s) == child.Address then return true end
+        end
+        return false
+    end
+    -- Parent: Weapons' parent is ViewModels, and ViewModels' is Assets.
+    local function parentOk(off) return rd(wf.Address + off) == vm.Address and rd(vm.Address + off) == A.Address end
+    if not parentOk(OFF.Parent) then
+        for off = 0x30, 0x200, 8 do
+            if parentOk(off) then OFF.Parent = off fixed[#fixed + 1] = "Parent" break end
+        end
+    end
+    -- Name: the name string of Weapons and ViewModels.
+    local function nameOk(off) return stdString(rd(wf.Address + off)) == "Weapons" and stdString(rd(vm.Address + off)) == "ViewModels" end
+    if not nameOk(OFF.NameContainer) then
+        for off = 0x30, 0x200, 8 do
+            if nameOk(off) then OFF.NameContainer = off fixed[#fixed + 1] = "Name" break end
+        end
+    end
+    -- Children: ViewModels' children list holds Weapons.
+    if not holdsChild(vm, wf, OFF.Children) then
+        for off = 0x30, 0x200, 8 do
+            if off ~= OFF.Parent and off ~= OFF.NameContainer and holdsChild(vm, wf, off) then
+                OFF.Children = off fixed[#fixed + 1] = "Children" break
+            end
+        end
+    end
+    -- Transparency: compared with what the game reports for a few parts.
+    local parts, seeThrough = {}, 0
+    for _, d in ipairs(wf:GetDescendants()) do
+        if d.ClassName == "Part" or d.ClassName == "MeshPart" then
+            local ok, t = pcall(function() return d.Transparency end)
+            if ok and type(t) == "number" then
+                parts[#parts + 1] = {d, t}
+                if t > 0.01 and t < 0.99 or t == 1 then seeThrough = seeThrough + 1 end
+            end
+            if #parts >= 40 and seeThrough >= 2 then break end
+        end
+    end
+    local function transpOk(off)
+        for _, p in ipairs(parts) do
+            local ok, v = pcall(mrd, "float", p[1].Address + off)
+            if not ok or not v or math.abs(v - p[2]) > 1e-4 then return false end
+        end
+        return true
+    end
+    -- All-opaque samples would match any zero float, so they prove nothing.
+    if seeThrough > 0 and not transpOk(OFF.Transparency) then
+        for off = 0x100, 0x200, 4 do
+            if transpOk(off) then OFF.Transparency = off fixed[#fixed + 1] = "Transparency" break end
+        end
+    end
+    local info = _G.__RSC_OFFSETS
+    print("[RivalsSkinChanger] Offsets: " .. info.from .. (info.version and (" (" .. info.version .. ")") or "")
+        .. (info.fits == true and " - fits this Roblox build" or (info.fits == nil and info.version and " - fit not checked" or ""))
+        .. (info.skipped and (" - the online offsets are for " .. tostring(info.skipped) .. ", not this build") or "")
+        .. (#fixed > 0 and (" - corrected on the live game: " .. table.concat(fixed, ", ")) or ""))
+end
+verifyOffsets()
+
+-- The undo data (what each swap overwrote) lives in _G, which a Matcha restart
+-- or update wipes while the game keeps the swaps. A run then would swap the
+-- models back and leave the rest of its work on the wrong ones. So each run
+-- also saves the data to a file, keyed by this server; the next run reads it
+-- back when _G has none, and undoes the old swaps before applying again.
+local UNDO_FILE = "rivals_undo_state.txt"
+local SERVER_KEY = tostring(game.JobId) .. ":" .. tostring(wf.Address)
+-- Returns the saved state for this server, nil when there is none, or
+-- false when there is one that can't be read.
+local function loadUndo()
+    local okF, text = pcall(function() return isfile(UNDO_FILE) and readfile(UNDO_FILE) or nil end)
+    if not okF or type(text) ~= "string" then return nil end
+    local lines = {}
+    for line in text:gmatch("[^\r\n]+") do lines[#lines + 1] = line end
+    if lines[1] ~= SERVER_KEY then return nil end
+    local function num(s) return s ~= "-" and tonumber(s) or nil end
+    local state = {restores = {}, nameCopies = {}, floats = {}, wfAddr = wf.Address}
+    for i = 2, #lines do
+        local f = {}
+        for word in lines[i]:gmatch("%S+") do f[#f + 1] = word end
+        local tag = f[1]
+        if tag == "R" and #f == 13 then
+            state.restores[#state.restores + 1] = {
+                defSlot = num(f[2]), skinSlot = num(f[3]), origDefInst = num(f[4]), origSkinInst = num(f[5]),
+                origDefCtrl = num(f[6]), origSkinCtrl = num(f[7]), defAddr = num(f[8]), skinAddr = num(f[9]),
+                origDefNC = num(f[10]), origSkinNC = num(f[11]), origDefParent = num(f[12]), origSkinParent = num(f[13])}
+        elseif tag == "N" and #f == 3 and num(f[2]) and num(f[3]) then
+            state.nameCopies[#state.nameCopies + 1] = {num(f[2]), num(f[3])}
+        elseif tag == "F" and #f == 3 and num(f[2]) and num(f[3]) then
+            state.floats[#state.floats + 1] = {num(f[2]), num(f[3])}
+        else
+            return false
+        end
+    end
+    return state
+end
+
+-- Undo the previous run
+local dictCache = {}
+do
+
+    local old = _G.__RIVALS_COSMETICS_STATE
+    _G.__RIVALS_COSMETICS_STATE = nil
+    if type(old) == "table" and type(old.restores) == "table" then
+        local fin = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+        fin = fin and fin:FindFirstChild("Finishers")
+        local charmsFolder = A and A:FindFirstChild("Charms")
+        if old.key == tostring(fin and fin.Address) .. "/" .. tostring(charmsFolder and charmsFolder.Address) then
+            for i = #old.restores, 1, -1 do
+                local r = old.restores[i]
+                if r.nameSlot then
+                    wr(r.nameSlot, r.name)
+                else
+                    wr(r.sa, r.ia) if r.ca then wr(r.sa + 8, r.ca) end
+                    wr(r.sb, r.ib) if r.cb then wr(r.sb + 8, r.cb) end
+                    wr(r.ia + OFF.NameContainer, r.na)
+                    wr(r.ib + OFF.NameContainer, r.nb)
+                    wr(r.ia + OFF.Parent, r.pa)
+                    wr(r.ib + OFF.Parent, r.pb)
+                end
+            end
+        end
+    end
+
+    local prev = _G.__RIVALS_SKIN_CHANGER_STATE
+    _G.__RIVALS_SKIN_CHANGER_STATE = nil
+    if type(prev) ~= "table" then
+        local saved = loadUndo()
+        if saved == false then
+            print("[RivalsSkinChanger] Skins were applied in this server before Matcha restarted, and the saved undo data can't be read, so applying again would mix the models up. Rejoin, then run it once.")
+            if typeof(notify) == "function" then
+                pcall(notify, "Applied before Matcha restarted - rejoin, then run it once", "Rivals Skin Changer", 8)
+            end
+            _G.__RIVALS_SKIN_CHANGER_BUSY = nil
+            return
+        elseif saved then
+            prev = saved
+            print("[RivalsSkinChanger] Matcha restarted since the last run - undoing its swaps from the saved file first")
+        end
+    end
+
+    if type(prev) == "table" and type(prev.restores) == "table" and prev.wfAddr == wf.Address then
+        if type(prev.dicts) == "table" then dictCache = prev.dicts end
+
+        for i = #prev.restores, 1, -1 do
+            local r = prev.restores[i]
+            if r.defSlot and r.origDefInst then
+                wr(r.defSlot, r.origDefInst)
+                if r.origDefCtrl then wr(r.defSlot + 8, r.origDefCtrl) end
+            end
+            if r.skinSlot and r.origSkinInst then
+                wr(r.skinSlot, r.origSkinInst)
+                if r.origSkinCtrl then wr(r.skinSlot + 8, r.origSkinCtrl) end
+            end
+            if r.defAddr and r.origDefNC then wr(r.defAddr + OFF.NameContainer, r.origDefNC) end
+            if r.skinAddr and r.origSkinNC then wr(r.skinAddr + OFF.NameContainer, r.origSkinNC) end
+            if r.defAddr and r.origDefParent then wr(r.defAddr + OFF.Parent, r.origDefParent) end
+            if r.skinAddr and r.origSkinParent then wr(r.skinAddr + OFF.Parent, r.origSkinParent) end
+        end
+        local nc = prev.nameCopies or {}
+        for i = #nc, 1, -1 do
+            if nc[i][2] then wr(nc[i][1], nc[i][2]) end
+        end
+        local fl = prev.floats or {}
+        for i = #fl, 1, -1 do
+            pcall(mwr, "float", fl[i][1], fl[i][2])
+        end
+    end
+end
+
+local IMG_OFF = 0xA10
+
+-- Folder slots
+local ga = function(f)
+    if not f or not f.Address then return end
+    local n = rd(f.Address + OFF.Children)
+    if not n or n == 0 then return end
+    local b, e = rd(n), rd(n + 8)
+    if b and e then return b, e end
+end
+
+local function findSlotAddress(inst, targetFolder)
+    if not inst or not inst.Address or not targetFolder or not targetFolder.Address then return nil end
+    local b, e = ga(targetFolder)
+    if not b or not e then return nil end
+    for slotAddr = b, e - 16, 16 do
+        if rd(slotAddr) == inst.Address then
+            return slotAddr
+        end
+    end
+    return nil
+end
+
+-- Hotbar icons
+local function writeImage(label, newAssetId)
+    if not _scriptAlive or not label or not label.Address or not newAssetId then return false end
+    if not label:IsDescendantOf(game) then return false end
+    local a = label.Address
+    local ptr = mrd("uintptr_t", a + IMG_OFF)
+    if not ptr or ptr < 0x10000000000 or ptr > 0x7FFFFFFFFFFF then return false end
+    local cur = mrd("string", ptr)
+    if not cur or cur == newAssetId then return true end
+    local cap = mrd("uint64_t", a + IMG_OFF + 24) or 31
+    local len = #newAssetId
+    if len > cap then return false end
+    for i = 1, len do
+        mwr("uint8_t", ptr + i - 1, string.byte(newAssetId, i))
+    end
+    mwr("uint8_t", ptr + len, 0)
+    mwr("uint64_t", a + IMG_OFF + 16, len)
+    return true
+end
+
+local function checkImgOffset()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local votes, checked = {}, 0
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d.ClassName == "ImageLabel" and d.Address then
+            checked = checked + 1
+            for off = 0x900, 0xC00, 8 do
+                local ptr = mrd("uintptr_t", d.Address + off)
+                if ptr and ptr > 0x10000000000 and ptr < 0x7FFFFFFFFFFF then
+                    local s = mrd("string", ptr)
+                    if s and s:find("rbxassetid://") then votes[off] = (votes[off] or 0) + 1 end
+                end
+            end
+            if checked >= 40 then break end
+        end
+    end
+    local best, bestN = nil, 0
+    for off, n in pairs(votes) do
+        if n > bestN then best, bestN = off, n end
+    end
+    if best and bestN >= 2 then IMG_OFF = best end
+end
+pcall(checkImgOffset)
+
+-- Viewmodel root fix
+local function fixViewModelRoots()
+    local containers = {}
+    if LP:FindFirstChild("PlayerScripts") and LP.PlayerScripts:FindFirstChild("Assets") and LP.PlayerScripts.Assets:FindFirstChild("Misc") then
+        table.insert(containers, LP.PlayerScripts.Assets.Misc)
+    end
+    local sp = game:GetService("StarterPlayer")
+    if sp:FindFirstChild("StarterPlayerScripts") and sp.StarterPlayerScripts:FindFirstChild("Assets") and sp.StarterPlayerScripts.Assets:FindFirstChild("Misc") then
+        table.insert(containers, sp.StarterPlayerScripts.Assets.Misc)
+    end
+
+    -- A real RightArm to copy the name from: Matcha's Name setter writes into
+    -- the shared name holder, which corrupts every other object with that name.
+    local source
+    for _, misc in ipairs(containers) do
+        local vmr = misc:FindFirstChild("ViewModelRoot")
+        source = source or (vmr and vmr:FindFirstChild("RightArm"))
+    end
+    for _, misc in ipairs(containers) do
+        local vmr = misc:FindFirstChild("ViewModelRoot")
+        if source and vmr and not vmr:FindFirstChild("RightArm") then
+            for _, c in ipairs(vmr:GetChildren()) do
+                if c.ClassName == "Part" and (c.Name == "" or c.Name == "_fake") then
+                    -- The name pointer, with one more count on its holder (see copyName).
+                    local holder = rd(source.Address + OFF.NameContainer)
+                    local okC, count = pcall(mrd, "int", (holder or 0) + 4)
+                    if holder and holder > 0x10000 and okC and count and count >= 1 and count < 100000000 then
+                        pcall(mwr, "int", holder + 4, count + 1)
+                        wr(c.Address + OFF.NameContainer, holder)
+                    end
+                    break
+                end
+            end
+        end
+    end
+end
+pcall(fixViewModelRoots)
+
+-- Icon ids
+local ITEM_ICONS = {
+    ["Assault Rifle"] = {
+        ["Standard"] = "rbxassetid://17160682738",
+        ["10B Visits"] = "rbxassetid://122165086598560",
+        ["AK-47"] = "rbxassetid://17691132793",
+        ["AKEY-47"] = "rbxassetid://80017496220683",
+        ["Augmented Rifle"] = "rbxassetid://18770192853",
+        ["Boneclaw Rifle"] = "rbxassetid://100015754284323",
+        ["Drum Gun"] = "rbxassetid://111251887761435",
+        ["Gingerbread Augmented Rifle"] = "rbxassetid://85584922619813",
+        ["Glorious Assault Rifle"] = "rbxassetid://130669996688265",
+        ["Pearl Rifle"] = "rbxassetid://135277426561503",
+        ["Phoenix Rifle"] = "rbxassetid://140228738718621",
+    },
+    ["Battle Axe"] = {
+        ["Standard"] = "rbxassetid://93390542043222",
+        ["Balloon Axe"] = "rbxassetid://102429983628211",
+        ["Ban Axe"] = "rbxassetid://111046431576859",
+        ["Cerulean Axe"] = "rbxassetid://76353832683350",
+        ["Glorious Battle Axe"] = "rbxassetid://87227212476138",
+        ["Keyttle Axe"] = "rbxassetid://122117068984402",
+        ["Mimic Axe"] = "rbxassetid://111717370450373",
+        ["Nordic Axe"] = "rbxassetid://80052264197135",
+        ["Street Sign"] = "rbxassetid://121743888148209",
+        ["The Shred"] = "rbxassetid://71234381808727",
+        ["Tiki Axe"] = "rbxassetid://87247443182820",
+    },
+    ["Bow"] = {
+        ["Standard"] = "rbxassetid://17160802080",
+        ["Balloon Bow"] = "rbxassetid://128957010941029",
+        ["Bat Bow"] = "rbxassetid://108984987378619",
+        ["Beloved Bow"] = "rbxassetid://110219131386799",
+        ["Compound Bow"] = "rbxassetid://17672234242",
+        ["Dream Bow"] = "rbxassetid://101089313144218",
+        ["Frostbite Bow"] = "rbxassetid://121895626623160",
+        ["Glorious Bow"] = "rbxassetid://84201415206621",
+        ["Key Bow"] = "rbxassetid://122525140091212",
+        ["Palm Bow"] = "rbxassetid://82899577710787",
+        ["Raven Bow"] = "rbxassetid://18766861627",
+    },
+    ["Burst Rifle"] = {
+        ["Standard"] = "rbxassetid://17160801983",
+        ["Aqua Burst"] = "rbxassetid://18837670807",
+        ["Bullpup Burst"] = "rbxassetid://74974560606812",
+        ["Electro Rifle"] = "rbxassetid://132227459821018",
+        ["Glorious Burst Rifle"] = "rbxassetid://78517330608597",
+        ["Keyst Rifle"] = "rbxassetid://78377522426003",
+        ["Pine Burst"] = "rbxassetid://132753732294083",
+        ["Pixel Burst"] = "rbxassetid://102648809593259",
+        ["Sand Bullpup Burst"] = "rbxassetid://130731663986683",
+        ["Spectral Burst"] = "rbxassetid://135012309412679",
+    },
+    ["Chainsaw"] = {
+        ["Standard"] = "rbxassetid://17160801873",
+        ["Blobsaw"] = "rbxassetid://17825963589",
+        ["Buzzsaw"] = "rbxassetid://74057448201836",
+        ["Festive Buzzsaw"] = "rbxassetid://80811854818775",
+        ["Glorious Chainsaw"] = "rbxassetid://122622447397834",
+        ["Handsaws"] = "rbxassetid://18766864583",
+        ["Mega Drill"] = "rbxassetid://76663867023998",
+        ["Sharksaw"] = "rbxassetid://136881251000627",
+    },
+    ["Crossbow"] = {
+        ["Standard"] = "rbxassetid://140211832612284",
+        ["Arch Crossbow"] = "rbxassetid://94981733362451",
+        ["Campfire Crossbow"] = "rbxassetid://76911697867059",
+        ["Crossbone"] = "rbxassetid://103469183638638",
+        ["Frostbite Crossbow"] = "rbxassetid://101536997945363",
+        ["Glorious Crossbow"] = "rbxassetid://70875146419725",
+        ["Harpoon Crossbow"] = "rbxassetid://107460405492001",
+        ["Pixel Crossbow"] = "rbxassetid://115931961841903",
+        ["Spider Crossbow"] = "rbxassetid://127435004964157",
+        ["Violin Crossbow"] = "rbxassetid://74401302514014",
+    },
+    ["Daggers"] = {
+        ["Standard"] = "rbxassetid://91885384580845",
+        ["Aces"] = "rbxassetid://139089881483398",
+        ["Bat Daggers"] = "rbxassetid://92001964015225",
+        ["Broken Hearts"] = "rbxassetid://74156924296351",
+        ["Cookies"] = "rbxassetid://114482325531769",
+        ["Crystal Daggers"] = "rbxassetid://126221748659600",
+        ["Cursed Daggers"] = "rbxassetid://118411124813458",
+        ["Glorious Daggers"] = "rbxassetid://76023189104485",
+        ["Keynais"] = "rbxassetid://84562761142610",
+        ["Paper Planes"] = "rbxassetid://84003122595879",
+        ["Shurikens"] = "rbxassetid://135574097643275",
+        ["Starfish"] = "rbxassetid://114567820096083",
+        ["Toaster"] = "rbxassetid://103344379002564",
+    },
+    ["Distortion"] = {
+        ["Standard"] = "rbxassetid://115712150398379",
+        ["Bubble Distortion"] = "rbxassetid://73319804282513",
+        ["Cyber Distortion"] = "rbxassetid://88995062151276",
+        ["Electropunk Distortion"] = "rbxassetid://109544539643046",
+        ["Experiment D15"] = "rbxassetid://103446773933340",
+        ["Glorious Distortion"] = "rbxassetid://134722661973710",
+        ["Magma Distortion"] = "rbxassetid://81103807698156",
+        ["Plasma Distortion"] = "rbxassetid://126813935337091",
+        ["Sleighstortion"] = "rbxassetid://111242141481650",
+    },
+    ["Energy Pistols"] = {
+        ["Standard"] = "rbxassetid://79471670126710",
+        ["Apex Pistols"] = "rbxassetid://136156057859453",
+        ["Enerkey Pistols"] = "rbxassetid://132955794587057",
+        ["Glorious Energy Pistols"] = "rbxassetid://114418789647547",
+        ["Hacker Pistols"] = "rbxassetid://140621407555872",
+        ["Hydro Pistols"] = "rbxassetid://115281889984097",
+        ["Hyperlaser Guns"] = "rbxassetid://106947526362970",
+        ["New Year Energy Pistols"] = "rbxassetid://126589959779039",
+        ["Sol Pistols"] = "rbxassetid://115012735954576",
+        ["Soul Pistols"] = "rbxassetid://72213738067158",
+        ["Void Pistols"] = "rbxassetid://111278471262300",
+    },
+    ["Energy Rifle"] = {
+        ["Standard"] = "rbxassetid://110259279810005",
+        ["Apex Rifle"] = "rbxassetid://88144772234151",
+        ["Enerkey Rifle"] = "rbxassetid://80940171527853",
+        ["Glorious Energy Rifle"] = "rbxassetid://72632815443247",
+        ["Hacker Rifle"] = "rbxassetid://122816271917525",
+        ["Hydro Rifle"] = "rbxassetid://73690448730060",
+        ["New Year Energy Rifle"] = "rbxassetid://111446782522703",
+        ["Sol Rifle"] = "rbxassetid://96272849525291",
+        ["Soul Rifle"] = "rbxassetid://129351366788323",
+        ["Void Rifle"] = "rbxassetid://95985016411441",
+    },
+    ["Exogun"] = {
+        ["Standard"] = "rbxassetid://17344796376",
+        ["Exogourd"] = "rbxassetid://137140750597688",
+        ["Glorious Exogun"] = "rbxassetid://129125201034206",
+        ["Midnight Festive Exogun"] = "rbxassetid://127612442529810",
+        ["Pearl Exogun"] = "rbxassetid://77698515863000",
+        ["Ray Gun"] = "rbxassetid://18766861454",
+        ["Repulsor"] = "rbxassetid://109263387714628",
+        ["Singularity"] = "rbxassetid://17676876756",
+        ["Wondergun"] = "rbxassetid://17672060360",
+    },
+    ["Fists"] = {
+        ["Standard"] = "rbxassetid://17160801745",
+        ["Boxing Gloves"] = "rbxassetid://17672060486",
+        ["Brass Knuckles"] = "rbxassetid://106879679389340",
+        ["Crab Claws"] = "rbxassetid://127492118111080",
+        ["Festive Fists"] = "rbxassetid://102757458529795",
+        ["Fist"] = "rbxassetid://109585706680035",
+        ["Fists of Hurt"] = "rbxassetid://140103672289959",
+        ["Glorious Fists"] = "rbxassetid://112839297231399",
+        ["Pirate Hook"] = "rbxassetid://116717593932616",
+        ["Pumpkin Claws"] = "rbxassetid://90996407819750",
+        ["Spy Gloves"] = "rbxassetid://117198095640784",
+        ["Towerstone Fists"] = "rbxassetid://72219935395375",
+    },
+    ["Flamethrower"] = {
+        ["Standard"] = "rbxassetid://89455038280473",
+        ["Bubblethrower"] = "rbxassetid://76812523297712",
+        ["Extinguisher"] = "rbxassetid://95815875434568",
+        ["Glitterthrower"] = "rbxassetid://88920581735649",
+        ["Glorious Flamethrower"] = "rbxassetid://71676635953177",
+        ["Jack O'Thrower"] = "rbxassetid://140280020818514",
+        ["Keythrower"] = "rbxassetid://130308634220965",
+        ["Lamethrower"] = "rbxassetid://18766862822",
+        ["Pixel Flamethrower"] = "rbxassetid://17771752104",
+        ["Rainbowthrower"] = "rbxassetid://102070206928252",
+        ["Snowblower"] = "rbxassetid://128743586418880",
+    },
+    ["Flare Gun"] = {
+        ["Standard"] = "rbxassetid://17160801627",
+        ["Banana Flare"] = "rbxassetid://123589213761955",
+        ["Dynamite Gun"] = "rbxassetid://18766865384",
+        ["Firework Gun"] = "rbxassetid://17691132917",
+        ["Glorious Flare Gun"] = "rbxassetid://115324763672074",
+        ["Pocket Volcano"] = "rbxassetid://133260045254190",
+        ["Vexed Flare Gun"] = "rbxassetid://116287930550049",
+        ["Wrapped Flare Gun"] = "rbxassetid://135638020129378",
+    },
+    ["Flashbang"] = {
+        ["Standard"] = "rbxassetid://17160801529",
+        ["Camera"] = "rbxassetid://18766865640",
+        ["Disco Ball"] = "rbxassetid://17672061796",
+        ["Glorious Flashbang"] = "rbxassetid://96760506528185",
+        ["Lightbulb"] = "rbxassetid://125489177573287",
+        ["Pixel Flashbang"] = "rbxassetid://132815625474597",
+        ["Shining Star"] = "rbxassetid://108392227354212",
+        ["Skullbang"] = "rbxassetid://73796957224972",
+        ["Sol"] = "rbxassetid://124026864365877",
+    },
+    ["Freeze Ray"] = {
+        ["Standard"] = "rbxassetid://18429552328",
+        ["Bubble Ray"] = "rbxassetid://18766865819",
+        ["Cooler"] = "rbxassetid://117258208589940",
+        ["Glorious Freeze Ray"] = "rbxassetid://120211873831101",
+        ["Gum Ray"] = "rbxassetid://121504417727123",
+        ["Spider Ray"] = "rbxassetid://136838810668332",
+        ["Temporal Ray"] = "rbxassetid://18429552503",
+        ["Wrapped Freeze Ray"] = "rbxassetid://76183738050112",
+    },
+    ["Grappler"] = {
+        ["Standard"] = "rbxassetid://103255844976245",
+        ["Arcade Claw"] = "rbxassetid://81529455948004",
+        ["Fishing Rod"] = "rbxassetid://86648406311812",
+        ["Genie Lamp"] = "rbxassetid://118514051859760",
+        ["Glorious Grappler"] = "rbxassetid://113576961532090",
+        ["Lasso"] = "rbxassetid://77061966583531",
+        ["Lifeguard Grappler"] = "rbxassetid://91214316625102",
+        ["Web Shooters"] = "rbxassetid://96604638344437",
+    },
+    ["Grenade"] = {
+        ["Standard"] = "rbxassetid://17160801411",
+        ["Batnade"] = "rbxassetid://80166736095109",
+        ["Cuddle Bomb"] = "rbxassetid://116801887274189",
+        ["Dynamite"] = "rbxassetid://119066463640901",
+        ["Fizz Bomb"] = "rbxassetid://123256093694497",
+        ["Frozen Grenade"] = "rbxassetid://96120996159611",
+        ["Glorious Grenade"] = "rbxassetid://103034870490455",
+        ["Jingle Grenade"] = "rbxassetid://97646859596860",
+        ["Keynade"] = "rbxassetid://102785971311114",
+        ["Soul Grenade"] = "rbxassetid://85903097459179",
+        ["Water Balloon"] = "rbxassetid://18766859819",
+        ["Whoopee Cushion"] = "rbxassetid://17672062933",
+    },
+    ["Grenade Launcher"] = {
+        ["Standard"] = "rbxassetid://17250453814",
+        ["Balloon Launcher"] = "rbxassetid://137862701599991",
+        ["Coconut Launcher"] = "rbxassetid://77621998397460",
+        ["Gearnade Launcher"] = "rbxassetid://133756750612042",
+        ["Glorious Grenade Launcher"] = "rbxassetid://134130354519919",
+        ["Skull Launcher"] = "rbxassetid://103257281022910",
+        ["Snowball Launcher"] = "rbxassetid://112349955391111",
+        ["Swashbuckler"] = "rbxassetid://17821233828",
+        ["Uranium Launcher"] = "rbxassetid://18766860114",
+    },
+    ["Gunblade"] = {
+        ["Standard"] = "rbxassetid://131231034374465",
+        ["Batblade"] = "rbxassetid://77137375179306",
+        ["Boneblade"] = "rbxassetid://126327381608481",
+        ["Crude Gunblade"] = "rbxassetid://126996645502136",
+        ["Elf's Gunblade"] = "rbxassetid://114103306647123",
+        ["Glorious Gunblade"] = "rbxassetid://88003799126136",
+        ["Gunsaw"] = "rbxassetid://102700915422689",
+        ["Hyper Gunblade"] = "rbxassetid://134415898983004",
+        ["Keyblade"] = "rbxassetid://117153249348040",
+        ["Sharkbite"] = "rbxassetid://85479471132931",
+    },
+    ["Handgun"] = {
+        ["Standard"] = "rbxassetid://17160801282",
+        ["Blaster"] = "rbxassetid://17821234554",
+        ["Gingerbread Handgun"] = "rbxassetid://95881238590412",
+        ["Glorious Handgun"] = "rbxassetid://85129427786041",
+        ["Gumball Handgun"] = "rbxassetid://106890990556815",
+        ["Hand Gun"] = "rbxassetid://18837670624",
+        ["Pixel Handgun"] = "rbxassetid://82199841278177",
+        ["Pumpkin Handgun"] = "rbxassetid://88495685924653",
+        ["Sandgun"] = "rbxassetid://111746039012812",
+        ["Stealth Handgun"] = "rbxassetid://124919185835138",
+        ["Towerstone Handgun"] = "rbxassetid://88654252790032",
+        ["Warp Handgun"] = "rbxassetid://102974911528828",
+    },
+    ["Jump Pad"] = {
+        ["Standard"] = "rbxassetid://79459600453621",
+        ["Bounce House"] = "rbxassetid://71226436012588",
+        ["Flamingo Floatie"] = "rbxassetid://127511599700842",
+        ["Glorious Jump Pad"] = "rbxassetid://71803398862947",
+        ["Jolly Man"] = "rbxassetid://97375473537804",
+        ["Shady Chicken Sandwich"] = "rbxassetid://86361684164972",
+        ["Spider Web"] = "rbxassetid://84204578032332",
+        ["Trampoline"] = "rbxassetid://103567857194140",
+    },
+    ["Katana"] = {
+        ["Standard"] = "rbxassetid://17160801158",
+        ["Arch Katana"] = "rbxassetid://94679283541658",
+        ["Crystal Katana"] = "rbxassetid://88872493010693",
+        ["Cutlass"] = "rbxassetid://77773371747122",
+        ["Evil Trident"] = "rbxassetid://101234805269080",
+        ["Glorious Katana"] = "rbxassetid://75588958786035",
+        ["Keytana"] = "rbxassetid://118899310989170",
+        ["Lightning Bolt"] = "rbxassetid://18768968241",
+        ["Linked Sword"] = "rbxassetid://83575725004177",
+        ["New Year Katana"] = "rbxassetid://102866488046710",
+        ["Pixel Katana"] = "rbxassetid://127922483074145",
+        ["Riptide Katana"] = "rbxassetid://136245206320139",
+        ["Saber"] = "rbxassetid://17672062341",
+        ["Stellar Katana"] = "rbxassetid://72617738655198",
+        ["Swordfish"] = "rbxassetid://105748422389590",
+    },
+    ["Knife"] = {
+        ["Standard"] = "rbxassetid://17160800983",
+        ["Armature.001"] = "rbxassetid://104026327618871",
+        ["Balisong"] = "rbxassetid://93303458333011",
+        ["Birthday Candle"] = "rbxassetid://74148583096733",
+        ["Caladbolg"] = "rbxassetid://101180142582964",
+        ["Candy Cane"] = "rbxassetid://124021545052910",
+        ["Chancla"] = "rbxassetid://17672060795",
+        ["Glorious Knife"] = "rbxassetid://77448895595314",
+        ["Karambat"] = "rbxassetid://77250751309827",
+        ["Karambit"] = "rbxassetid://18766863586",
+        ["Keylisong"] = "rbxassetid://100084654831857",
+        ["Keyrambit"] = "rbxassetid://108512337101248",
+        ["Machete"] = "rbxassetid://84364955819899",
+        ["Pencil"] = "rbxassetid://131450909376802",
+        ["Shark Tooth"] = "rbxassetid://124265657652842",
+        ["Trophy Knife"] = "rbxassetid://78822531823097",
+    },
+    ["Maul"] = {
+        ["Standard"] = "rbxassetid://81478141693597",
+        ["Ban Hammer"] = "rbxassetid://126491383967029",
+        ["Clown Hammer"] = "rbxassetid://95487416883384",
+        ["Excalibur"] = "rbxassetid://81905348145140",
+        ["Giant Popsicle"] = "rbxassetid://91916939347642",
+        ["Glorious Maul"] = "rbxassetid://125917253783002",
+        ["Ice Maul"] = "rbxassetid://100001888078290",
+        ["Jeremiah"] = "rbxassetid://109379867345162",
+        ["Sleigh Maul"] = "rbxassetid://114892026951995",
+        ["Starforge Maul"] = "rbxassetid://113691709735527",
+    },
+    ["Medkit"] = {
+        ["Standard"] = "rbxassetid://17160800734",
+        ["Box of Chocolates"] = "rbxassetid://132421415091712",
+        ["Briefcase"] = "rbxassetid://18142172067",
+        ["Bucket of Candy"] = "rbxassetid://93791981490691",
+        ["Glorious Medkit"] = "rbxassetid://73358160718523",
+        ["Ice Cream"] = "rbxassetid://131246559128209",
+        ["Laptop"] = "rbxassetid://18770164868",
+        ["Medkitty"] = "rbxassetid://125732280509514",
+        ["Milk & Cookies"] = "rbxassetid://99156135330432",
+        ["Sandwich"] = "rbxassetid://17838232333",
+    },
+    ["Minigun"] = {
+        ["Standard"] = "rbxassetid://17250458611",
+        ["Fighter Jet"] = "rbxassetid://70780739230558",
+        ["Glorious Minigun"] = "rbxassetid://84246894288637",
+        ["Lasergun 3000"] = "rbxassetid://103437974285778",
+        ["Pixel Minigun"] = "rbxassetid://18766861798",
+        ["Pumpkin Minigun"] = "rbxassetid://77388785880854",
+        ["Shark Minigun"] = "rbxassetid://89295703576175",
+        ["Wrapped Minigun"] = "rbxassetid://127077702465909",
+    },
+    ["Molotov"] = {
+        ["Standard"] = "rbxassetid://109264750627289",
+        ["Arch Molotov"] = "rbxassetid://96589300342777",
+        ["Campfire Stick"] = "rbxassetid://83823494489693",
+        ["Coffee"] = "rbxassetid://17672061538",
+        ["Glorious Molotov"] = "rbxassetid://108930340066987",
+        ["Hot Coals"] = "rbxassetid://110423024723304",
+        ["Lava Lamp"] = "rbxassetid://79616583726432",
+        ["Ship In A Bottle"] = "rbxassetid://125699268308415",
+        ["Torch"] = "rbxassetid://115586189235552",
+        ["Vexed Candle"] = "rbxassetid://78128648928195",
+    },
+    ["Paintball Gun"] = {
+        ["Standard"] = "rbxassetid://17160853798",
+        ["Boba Gun"] = "rbxassetid://18768830660",
+        ["Brain Gun"] = "rbxassetid://85970592668118",
+        ["Glorious Paintball Gun"] = "rbxassetid://86297318955856",
+        ["Ketchup Gun"] = "rbxassetid://76083615050939",
+        ["Lemonade Gun"] = "rbxassetid://119390099120478",
+        ["Paintballoon Gun"] = "rbxassetid://100129918948246",
+        ["Slime Gun"] = "rbxassetid://17672062472",
+        ["Snowball Gun"] = "rbxassetid://113685354916533",
+    },
+    ["Permafrost"] = {
+        ["Standard"] = "rbxassetid://74353733133888",
+        ["Glorious Permafrost"] = "rbxassetid://119977291442329",
+        ["Ice Permafrost"] = "rbxassetid://83722160119335",
+        ["Permafrost.rbxm"] = "rbxassetid://77732280270853",
+        ["Permasand"] = "rbxassetid://108398272946629",
+        ["Snowman Permafrost"] = "rbxassetid://100890626643184",
+        ["Starforge Permafrost"] = "rbxassetid://105290041968367",
+        ["Temporal Permafrost"] = "rbxassetid://124975247676715",
+        ["Xenofrost"] = "rbxassetid://97111256967007",
+    },
+    ["RPG"] = {
+        ["Standard"] = "rbxassetid://17160802243",
+        ["Cupcake Launcher"] = "rbxassetid://100541838356180",
+        ["Firework Launcher"] = "rbxassetid://75233372670156",
+        ["Glorious RPG"] = "rbxassetid://130506879885802",
+        ["Nuke Launcher"] = "rbxassetid://17672061995",
+        ["Pencil Launcher"] = "rbxassetid://106934516693548",
+        ["Pumpkin Launcher"] = "rbxassetid://94648176067808",
+        ["Rocket Launcher"] = "rbxassetid://116931956715309",
+        ["RPKEY"] = "rbxassetid://108438721125410",
+        ["Spaceship Launcher"] = "rbxassetid://18766860860",
+        ["Squid Launcher"] = "rbxassetid://130764310743404",
+        ["Sundae Launcher"] = "rbxassetid://70578055340962",
+    },
+    ["Revolver"] = {
+        ["Standard"] = "rbxassetid://17160800299",
+        ["Boneclaw Revolver"] = "rbxassetid://119174697609264",
+        ["Cruise Revolver"] = "rbxassetid://72223124823807",
+        ["Desert Eagle"] = "rbxassetid://17821234372",
+        ["Glorious Revolver"] = "rbxassetid://118135542031794",
+        ["Keyvolver"] = "rbxassetid://87974031410344",
+        ["Peppergun"] = "rbxassetid://124178691056979",
+        ["Peppermint Sheriff"] = "rbxassetid://95859403750768",
+        ["Sheriff"] = "rbxassetid://18770192507",
+    },
+    ["Riot Shield"] = {
+        ["Standard"] = "rbxassetid://121172272442833",
+        ["Broken Surfboard"] = "rbxassetid://114987869792187",
+        ["Door"] = "rbxassetid://79242603995428",
+        ["Energy Shield"] = "rbxassetid://90215439337413",
+        ["Glorious Riot Shield"] = "rbxassetid://132866851386509",
+        ["Masterpiece"] = "rbxassetid://79914271483818",
+        ["Sled"] = "rbxassetid://73881731607231",
+        ["Tombstone Shield"] = "rbxassetid://125895528641243",
+    },
+    ["Satchel"] = {
+        ["Standard"] = "rbxassetid://82237471151891",
+        ["Advanced Satchel"] = "rbxassetid://113860326910548",
+        ["Bag o' Money"] = "rbxassetid://129192426700659",
+        ["Glorious Satchel"] = "rbxassetid://100521994805910",
+        ["Lifeguard Satchel"] = "rbxassetid://105277357472003",
+        ["Notebook Satchel"] = "rbxassetid://124817464748150",
+        ["Pizza Box"] = "rbxassetid://99166555665247",
+        ["Potion Satchel"] = "rbxassetid://76787046046890",
+        ["Suspicious Gift"] = "rbxassetid://76209303162814",
+    },
+    ["Scythe"] = {
+        ["Standard"] = "rbxassetid://17160800186",
+        ["Anchor"] = "rbxassetid://18766866743",
+        ["Bat Scythe"] = "rbxassetid://131711174838548",
+        ["Bug Net"] = "rbxassetid://115620701626004",
+        ["Cryo Scythe"] = "rbxassetid://119930754357379",
+        ["Crystal Scythe"] = "rbxassetid://73971549402646",
+        ["Glorious Scythe"] = "rbxassetid://115811939422419",
+        ["Keythe"] = "rbxassetid://114560926055433",
+        ["Palm Scythe"] = "rbxassetid://97379805071194",
+        ["Plastic Flamingo"] = "rbxassetid://112023194890462",
+        ["Sakura Scythe"] = "rbxassetid://133811689655966",
+        ["Scythe of Death"] = "rbxassetid://17825996537",
+    },
+    ["Shorty"] = {
+        ["Standard"] = "rbxassetid://17160800091",
+        ["Balloon Shorty"] = "rbxassetid://75590262133322",
+        ["Bubble Shorty"] = "rbxassetid://111294137896866",
+        ["Cannon Shorty"] = "rbxassetid://137616738436928",
+        ["Demon Shorty"] = "rbxassetid://116443498278384",
+        ["Glorious Shorty"] = "rbxassetid://105834197552222",
+        ["Lovely Shorty"] = "rbxassetid://18766862000",
+        ["Not So Shorty"] = "rbxassetid://17672062572",
+        ["Too Shorty"] = "rbxassetid://18129531276",
+        ["Wrapped Shorty"] = "rbxassetid://136522183669611",
+    },
+    ["Shotgun"] = {
+        ["Standard"] = "rbxassetid://17160800007",
+        ["Balloon Shotgun"] = "rbxassetid://17821234823",
+        ["Broomstick"] = "rbxassetid://118061559757082",
+        ["Cactus Shotgun"] = "rbxassetid://131606483507460",
+        ["Glorious Shotgun"] = "rbxassetid://71704618059601",
+        ["Hyper Shotgun"] = "rbxassetid://18768968419",
+        ["Shark Shotgun"] = "rbxassetid://116415689080224",
+        ["Shotkey"] = "rbxassetid://93004214983981",
+        ["Wrapped Shotgun"] = "rbxassetid://74894345245237",
+    },
+    ["Slingshot"] = {
+        ["Standard"] = "rbxassetid://17160799888",
+        ["Boneshot"] = "rbxassetid://86606957688341",
+        ["Glorious Slingshot"] = "rbxassetid://101195664167288",
+        ["Goalpost"] = "rbxassetid://17672063165",
+        ["Harp"] = "rbxassetid://80850043664453",
+        ["Keyshot"] = "rbxassetid://74006265601388",
+        ["Lucky Horseshoe"] = "rbxassetid://131242126669282",
+        ["Palmshot"] = "rbxassetid://109640024736812",
+        ["Reindeer Slingshot"] = "rbxassetid://121612921203624",
+        ["Slingshotula"] = "rbxassetid://80781358359670",
+        ["Stick"] = "rbxassetid://17672063048",
+    },
+    ["Smoke Grenade"] = {
+        ["Standard"] = "rbxassetid://17160799767",
+        ["Balance"] = "rbxassetid://18766866168",
+        ["Beach Ball"] = "rbxassetid://98068366944697",
+        ["Emoji Cloud"] = "rbxassetid://17821234077",
+        ["Eyeball"] = "rbxassetid://135911399763146",
+        ["Glorious Smoke Grenade"] = "rbxassetid://139714146508398",
+        ["Hourglass"] = "rbxassetid://108311418974073",
+        ["Snowglobe"] = "rbxassetid://119390465944051",
+    },
+    ["Sniper"] = {
+        ["Standard"] = "rbxassetid://17160799574",
+        ["Campfire Sniper"] = "rbxassetid://127790438907599",
+        ["Event Horizon"] = "rbxassetid://80749667426815",
+        ["Eyething Sniper"] = "rbxassetid://103915302076013",
+        ["Gingerbread Sniper"] = "rbxassetid://99943841952995",
+        ["Glorious Sniper"] = "rbxassetid://118012090175286",
+        ["Hyper Sniper"] = "rbxassetid://18766864081",
+        ["Keyper"] = "rbxassetid://85472935605264",
+        ["Kraken Sniper"] = "rbxassetid://95011666797584",
+        ["Light Fifty"] = "rbxassetid://138029440298487",
+        ["Pixel Sniper"] = "rbxassetid://17676081196",
+    },
+    ["Spear"] = {
+        ["Standard"] = "rbxassetid://122801133017271",
+        ["Chark Kebab"] = "rbxassetid://74005839754537",
+        ["Fork"] = "rbxassetid://105821360943308",
+        ["Giant Pencil"] = "rbxassetid://107812045486260",
+        ["Glorious Spear"] = "rbxassetid://98259628954838",
+        ["Gravelight"] = "rbxassetid://132190257399523",
+        ["Plunger"] = "rbxassetid://82393330699241",
+        ["Studio Light"] = "rbxassetid://70443632958263",
+        ["Thunderpike"] = "rbxassetid://137630900832105",
+    },
+    ["Spray"] = {
+        ["Standard"] = "rbxassetid://92882887485248",
+        ["Boneclaw Spray"] = "rbxassetid://114078818081911",
+        ["Campfire Spray"] = "rbxassetid://129294699009828",
+        ["Glorious Spray"] = "rbxassetid://138246745001490",
+        ["Key Spray"] = "rbxassetid://94061940442700",
+        ["Lovely Spray"] = "rbxassetid://131203015026683",
+        ["Nail Gun"] = "rbxassetid://110577809934251",
+        ["Pine Spray"] = "rbxassetid://128285758736343",
+        ["Spray Bottle"] = "rbxassetid://137955019285700",
+    },
+    ["Subspace Tripmine"] = {
+        ["Standard"] = "rbxassetid://17160799418",
+        ["Dev-in-the-Box"] = "rbxassetid://125056115146240",
+        ["DIY Tripmine"] = "rbxassetid://85747991601740",
+        ["Don't Press"] = "rbxassetid://17821233203",
+        ["Glorious Subspace Tripmine"] = "rbxassetid://112555928142930",
+        ["Hazard Sign"] = "rbxassetid://73264353773454",
+        ["Pot o' Keys"] = "rbxassetid://125355191847719",
+        ["Spring"] = "rbxassetid://18766860615",
+        ["Trick or Treat"] = "rbxassetid://101693036028491",
+    },
+    ["Trowel"] = {
+        ["Standard"] = "rbxassetid://17160799172",
+        ["Garden Shovel"] = "rbxassetid://18766864873",
+        ["Glorious Trowel"] = "rbxassetid://100888500368219",
+        ["Paintbrush"] = "rbxassetid://84687920829755",
+        ["Plastic Shovel"] = "rbxassetid://17672062201",
+        ["Pumpkin Carver"] = "rbxassetid://78827307308671",
+        ["Scooper"] = "rbxassetid://100816728062854",
+        ["Snow Shovel"] = "rbxassetid://78271338778848",
+    },
+    ["Uzi"] = {
+        ["Standard"] = "rbxassetid://17160798908",
+        ["Arch Uzi"] = "rbxassetid://139852585731073",
+        ["Demon Uzi"] = "rbxassetid://132973040482576",
+        ["Ducky Uzi"] = "rbxassetid://133780419950894",
+        ["Electro Uzi"] = "rbxassetid://96806694653207",
+        ["Glorious Uzi"] = "rbxassetid://120045334159124",
+        ["Keyzi"] = "rbxassetid://100392703246534",
+        ["Money Gun"] = "rbxassetid://100705725115757",
+        ["Pine Uzi"] = "rbxassetid://82545206964916",
+        ["Water Uzi"] = "rbxassetid://17821233590",
+    },
+    ["War Horn"] = {
+        ["Standard"] = "rbxassetid://104600246515190",
+        ["Air Horn"] = "rbxassetid://111168146142976",
+        ["Boneclaw Horn"] = "rbxassetid://138360812591331",
+        ["Glorious War Horn"] = "rbxassetid://96293355496772",
+        ["Lifeguard Whistle"] = "rbxassetid://93791958663348",
+        ["Mammoth Horn"] = "rbxassetid://93076834584542",
+        ["Megaphone"] = "rbxassetid://107074211847347",
+        ["Trumpet"] = "rbxassetid://88975601634708",
+    },
+    ["Warper"] = {
+        ["Standard"] = "rbxassetid://88033795039891",
+        ["Arcane Warper"] = "rbxassetid://83632373572638",
+        ["Bubbler"] = "rbxassetid://106002684466857",
+        ["Electropunk Warper"] = "rbxassetid://75386728379756",
+        ["Experiment W4"] = "rbxassetid://126884960764998",
+        ["Frost Warper"] = "rbxassetid://70539216094396",
+        ["Glitter Warper"] = "rbxassetid://94607497565715",
+        ["Glorious Warper"] = "rbxassetid://95823647035211",
+        ["Hotel Bell"] = "rbxassetid://117742703173821",
+    },
+    ["Warpstone"] = {
+        ["Standard"] = "rbxassetid://94035693279005",
+        ["Cyber Warpstone"] = "rbxassetid://133002984228937",
+        ["Electropunk Warpstone"] = "rbxassetid://75299042976369",
+        ["Glorious Warpstone"] = "rbxassetid://137583560042806",
+        ["Teleport Disc"] = "rbxassetid://104608154111107",
+        ["Unstable Warpstone"] = "rbxassetid://110083777654388",
+        ["Warp Juice"] = "rbxassetid://74381576761026",
+        ["Warpbone"] = "rbxassetid://96452209607150",
+        ["Warpeye"] = "rbxassetid://127023603234857",
+        ["Warpstar"] = "rbxassetid://102652397897598",
+    },
+    ["Wildcat"] = {
+        ["Standard"] = "rbxassetid://77401164737509",
+        ["Glorious Wildcat"] = "rbxassetid://115657943825380",
+        ["Mimic Wildcat"] = "rbxassetid://122326241760674",
+        ["Plasma Wildcat"] = "rbxassetid://86238922896100",
+        ["Shadow Wildcat"] = "rbxassetid://72652070473236",
+        ["Towerstone Wildcat"] = "rbxassetid://129631144327641",
+    },
+}
+
+local STANDARD_ICON_MAP = {
+    ["rbxassetid://17160682738"] = "Assault Rifle",
+    ["rbxassetid://93390542043222"] = "Battle Axe",
+    ["rbxassetid://17160802080"] = "Bow",
+    ["rbxassetid://17160801983"] = "Burst Rifle",
+    ["rbxassetid://17160801873"] = "Chainsaw",
+    ["rbxassetid://140211832612284"] = "Crossbow",
+    ["rbxassetid://91885384580845"] = "Daggers",
+    ["rbxassetid://115712150398379"] = "Distortion",
+    ["rbxassetid://79471670126710"] = "Energy Pistols",
+    ["rbxassetid://110259279810005"] = "Energy Rifle",
+    ["rbxassetid://17344796376"] = "Exogun",
+    ["rbxassetid://17160801745"] = "Fists",
+    ["rbxassetid://89455038280473"] = "Flamethrower",
+    ["rbxassetid://17160801627"] = "Flare Gun",
+    ["rbxassetid://17160801529"] = "Flashbang",
+    ["rbxassetid://18429552328"] = "Freeze Ray",
+    ["rbxassetid://103255844976245"] = "Grappler",
+    ["rbxassetid://17160801411"] = "Grenade",
+    ["rbxassetid://17250453814"] = "Grenade Launcher",
+    ["rbxassetid://131231034374465"] = "Gunblade",
+    ["rbxassetid://17160801282"] = "Handgun",
+    ["rbxassetid://79459600453621"] = "Jump Pad",
+    ["rbxassetid://17160801158"] = "Katana",
+    ["rbxassetid://17160800983"] = "Knife",
+    ["rbxassetid://81478141693597"] = "Maul",
+    ["rbxassetid://17160800734"] = "Medkit",
+    ["rbxassetid://17250458611"] = "Minigun",
+    ["rbxassetid://109264750627289"] = "Molotov",
+    ["rbxassetid://17160853798"] = "Paintball Gun",
+    ["rbxassetid://74353733133888"] = "Permafrost",
+    ["rbxassetid://17160802243"] = "RPG",
+    ["rbxassetid://17160800299"] = "Revolver",
+    ["rbxassetid://121172272442833"] = "Riot Shield",
+    ["rbxassetid://82237471151891"] = "Satchel",
+    ["rbxassetid://17160800186"] = "Scythe",
+    ["rbxassetid://17160800091"] = "Shorty",
+    ["rbxassetid://17160800007"] = "Shotgun",
+    ["rbxassetid://17160799888"] = "Slingshot",
+    ["rbxassetid://17160799767"] = "Smoke Grenade",
+    ["rbxassetid://17160799574"] = "Sniper",
+    ["rbxassetid://122801133017271"] = "Spear",
+    ["rbxassetid://92882887485248"] = "Spray",
+    ["rbxassetid://17160799418"] = "Subspace Tripmine",
+    ["rbxassetid://17160799172"] = "Trowel",
+    ["rbxassetid://17160798908"] = "Uzi",
+    ["rbxassetid://104600246515190"] = "War Horn",
+    ["rbxassetid://88033795039891"] = "Warper",
+    ["rbxassetid://94035693279005"] = "Warpstone",
+    ["rbxassetid://77401164737509"] = "Wildcat",
+}
+
+-- Skin models
+local EXACT_SKIN_MAP = {
+    ["AKEY-47"] = {folder = "Bundles", name = "AKEY-47"},
+    ["Key Bow"] = {folder = "Bundles", name = "Key Bow"},
+    ["Key Spray"] = {folder = "Bundles", name = "Key Spray"},
+    ["Keylisong"] = {folder = "Bundles", name = "Keylisong"},
+    ["Keynade"] = {folder = "Bundles", name = "Keynade"},
+    ["Keynais"] = {folder = "Bundles", name = "Keynais"},
+    ["Keyper"] = {folder = "Bundles", name = "Keyper"},
+    ["Keyst Rifle"] = {folder = "Bundles", name = "Keyst Rifle"},
+    ["Keythe"] = {folder = "Bundles", name = "Keythe"},
+    ["Keythrower"] = {folder = "Bundles", name = "Keythrower"},
+    ["Keyttle Axe"] = {folder = "Bundles", name = "Keyttle Axe"},
+    ["RPKEY"] = {folder = "Bundles", name = "RPKEY"},
+    ["Keyshot"] = {folder = "Bundles", name = "Keyshot"},
+    ["Keyblade"] = {folder = "Bundles", name = "Keyblade"},
+    ["Keyvolver"] = {folder = "Bundles", name = "Keyvolver"},
+    ["Shotkey"] = {folder = "Bundles", name = "Shotkey"},
+    ["Keyzi"] = {folder = "Bundles", name = "Keyzi"},
+    ["Keytana"] = {folder = "Bundles", name = "Keytana"},
+    ["Pot o' Keys"] = {folder = "Bundles", name = "Pot o' Keys"},
+    ["Cuddle Bomb"] = {folder = "Bundles", name = "Cuddle Bomb"},
+    ["Ban Hammer"] = {folder = "Bundles", name = "Ban Hammer"},
+    ["10B Visits"] = {folder = "Bundles", name = "10B Visits"},
+    ["Arch Crossbow"] = {folder = "Seasons", name = "Arch Crossbow"},
+    ["Arch Katana"] = {folder = "Seasons", name = "Arch Katana"},
+    ["Arch Uzi"] = {folder = "Seasons", name = "Arch Uzi"},
+    ["Arch Molotov"] = {folder = "Seasons", name = "Arch Molotov"},
+    ["Handsaws"] = {folder = "Skin Case 2", name = "Handsaws"},
+    ["Void Pistols"] = {folder = "Skin Case 2", name = "Void Pistols"},
+    ["Laptop"] = {folder = "Skin Case 2", name = "Laptop"},
+    ["Camera"] = {folder = "Skin Case 2", name = "Camera"},
+    ["Uranium Launcher"] = {folder = "Skin Case 2", name = "Uranium Launcher"},
+    ["AUG"] = {folder = "Skin Case 2", name = "AUG"},
+    ["Void Rifle"] = {folder = "Skin Case 3", name = "Void Rifle"},
+    ["Event Horizon"] = {folder = "Skin Case 3", name = "Event Horizon"},
+    ["Fighter Jet"] = {folder = "Skin Case 3", name = "Fighter Jet"},
+    ["Balloon Shorty"] = {folder = "Skin Case 3", name = "Balloon Shorty"},
+    ["Masterpiece"] = {folder = "Skin Case 3", name = "Masterpiece"},
+    ["Paintbrush"] = {folder = "Skin Case 3", name = "Paintbrush"},
+    ["Shady Chicken Sandwich"] = {folder = "Skin Case 3", name = "Shady Chicken Sandwich"},
+    ["Banana Flare"] = {folder = "Skin Case 3", name = "Banana Flare"},
+    ["Squid Flare"] = {folder = "Skin Case 3", name = "Banana Flare"},
+    ["Boneclaw Revolver"] = {folder = "Spooky Skin Case", name = "Boneclaw Revolver"},
+    ["Boneclaw Horn"] = {folder = "Spooky Skin Case", name = "Boneclaw Horn"},
+    ["Brain Gun"] = {folder = "Spooky Skin Case", name = "Brain Gun"},
+    ["Warpeye"] = {folder = "Spooky Skin Case", name = "Warpeye"},
+    ["Warpbone"] = {folder = "Spooky Skin Case", name = "Warpbone"},
+    ["Warpstar"] = {folder = "Spooky Skin Case", name = "Warpstar"},
+    ["Bat Bow"] = {folder = "Spooky Skin Case", name = "Bat Bow"},
+    ["Bat Daggers"] = {folder = "Spooky Skin Case", name = "Bat Daggers"},
+    ["Bat Scythe"] = {folder = "Spooky Skin Case", name = "Bat Scythe"},
+    ["Blobsaw"] = {folder = "Spooky Skin Case", name = "Blobsaw"},
+    ["Candy Bag"] = {folder = "Spooky Skin Case", name = "Candy Bag"},
+    ["Candy Bucket"] = {folder = "Spooky Skin Case", name = "Bucket Of Candy"},
+    ["Bucket Of Candy"] = {folder = "Spooky Skin Case", name = "Bucket Of Candy"},
+    ["Jack O'Launcher"] = {folder = "Spooky Skin Case", name = "Jack O'Launcher"},
+    ["Jack O'Thrower"] = {folder = "Spooky Skin Case", name = "Jack O'Thrower"},
+    ["Pumpkin Carver"] = {folder = "Spooky Skin Case", name = "Pumpkin Carver"},
+    ["Pumpkin Claws"] = {folder = "Spooky Skin Case", name = "Pumpkin Claws"},
+    ["Pumpkin Handgun"] = {folder = "Spooky Skin Case", name = "Pumpkin Handgun"},
+    ["Pumpkin Minigun"] = {folder = "Spooky Skin Case", name = "Pumpkin Minigun"},
+    ["Scythe of Death"] = {folder = "Spooky Skin Case", name = "Scythe of Death"},
+    ["Soul Grenade"] = {folder = "Spooky Skin Case", name = "Soul Grenade"},
+    ["Soul Pistols"] = {folder = "Spooky Skin Case", name = "Soul Pistols"},
+    ["Soul Rifle"] = {folder = "Spooky Skin Case", name = "Soul Rifle"},
+    ["Spider Ray"] = {folder = "Spooky Skin Case", name = "Spider Ray"},
+    ["Spider Web"] = {folder = "Spooky Skin Case", name = "Spider Web"},
+    ["Tombstone Shield"] = {folder = "Spooky Skin Case", name = "Tombstone Shield"},
+    ["Vexed Candle"] = {folder = "Spooky Skin Case", name = "Vexed Candle"},
+    ["Vexed Flare Gun"] = {folder = "Spooky Skin Case", name = "Vexed Flare Gun"},
+    ["Air Horn"] = {folder = "Community Skin Case", name = "Air Horn"},
+    ["Anchor"] = {folder = "Community Skin Case", name = "Anchor"},
+    ["Balance"] = {folder = "Community Skin Case", name = "Balance"},
+    ["Banana"] = {folder = "Community Skin Case", name = "Banana"},
+    ["Bongos"] = {folder = "Community Skin Case", name = "Bongos"},
+    ["Boombox"] = {folder = "Community Skin Case", name = "Boombox"},
+    ["Broken Hearts"] = {folder = "Community Skin Case", name = "Broken Hearts"},
+    ["Bubbler"] = {folder = "Community Skin Case", name = "Bubbler"},
+    ["Cardboard Gun"] = {folder = "Community Skin Case", name = "Cardboard Gun"},
+    ["Cupcake Launcher"] = {folder = "Community Skin Case", name = "Cupcake Launcher"},
+    ["Donut Gun"] = {folder = "Community Skin Case", name = "Donut Gun"},
+    ["Double Bass"] = {folder = "Community Skin Case", name = "Double Bass"},
+    ["Dragon Hammer"] = {folder = "Community Skin Case", name = "Dragon Hammer"},
+    ["Eyeball"] = {folder = "Community Skin Case", name = "Eyeball"},
+    ["Frying Pan"] = {folder = "Community Skin Case", name = "Frying Pan"},
+    ["Genie Lamp"] = {folder = "Community Skin Case", name = "Genie Lamp"},
+    ["Giggle Grenade"] = {folder = "Community Skin Case", name = "Giggle Grenade"},
+    ["Giggle Gun"] = {folder = "Community Skin Case", name = "Giggle Gun"},
+    ["Glove Knife"] = {folder = "Community Skin Case", name = "Glove Knife"},
+    ["Guitar"] = {folder = "Community Skin Case", name = "Guitar"},
+    ["Hotel Bell"] = {folder = "Community Skin Case", name = "Hotel Bell"},
+    ["Hourglass"] = {folder = "Community Skin Case", name = "Hourglass"},
+    ["Katana"] = {folder = "Community Skin Case", name = "Katana"},
+    ["Light Fifty"] = {folder = "Community Skin Case", name = "Light Fifty"},
+    ["Lightning Bolt"] = {folder = "Community Skin Case", name = "Lightning Bolt"},
+    ["Lollipop Hammer"] = {folder = "Community Skin Case", name = "Lollipop Hammer"},
+    ["Magic Wand"] = {folder = "Community Skin Case", name = "Magic Wand"},
+    ["Maracas"] = {folder = "Community Skin Case", name = "Maracas"},
+    ["Megaphone"] = {folder = "Community Skin Case", name = "Megaphone"},
+    ["Money Gun"] = {folder = "Community Skin Case", name = "Money Gun"},
+    ["Nail Gun"] = {folder = "Community Skin Case", name = "Nail Gun"},
+    ["Paper Planes"] = {folder = "Community Skin Case", name = "Paper Planes"},
+    ["Pencil Launcher"] = {folder = "Community Skin Case", name = "Pencil Launcher"},
+    ["Pencil"] = {folder = "Community Skin Case", name = "Pencil"},
+    ["Peppergun"] = {folder = "Community Skin Case", name = "Peppergun"},
+    ["Pinata Bat"] = {folder = "Community Skin Case", name = "Pinata Bat"},
+    ["Pizza Box"] = {folder = "Community Skin Case", name = "Pizza Box"},
+    ["Plunger"] = {folder = "Community Skin Case", name = "Plunger"},
+    ["Police Baton"] = {folder = "Community Skin Case", name = "Police Baton"},
+    ["Poseidon's Trident"] = {folder = "Community Skin Case", name = "Poseidon's Trident"},
+    ["Prismatic Hammer"] = {folder = "Community Skin Case", name = "Prismatic Hammer"},
+    ["Record Player"] = {folder = "Community Skin Case", name = "Record Player"},
+    ["Rubber Mallet"] = {folder = "Community Skin Case", name = "Rubber Mallet"},
+    ["Saxophone"] = {folder = "Community Skin Case", name = "Saxophone"},
+    ["Shuriken"] = {folder = "Community Skin Case", name = "Shurikens"},
+    ["Shurikens"] = {folder = "Community Skin Case", name = "Shurikens"},
+    ["Silly Guitar"] = {folder = "Community Skin Case", name = "Silly Guitar"},
+    ["Spatula"] = {folder = "Community Skin Case", name = "Spatula"},
+    ["Spray Bottle"] = {folder = "Community Skin Case", name = "Spray Bottle"},
+    ["Spring"] = {folder = "Community Skin Case", name = "Spring"},
+    ["Street Sign"] = {folder = "Community Skin Case", name = "Street Sign"},
+    ["Studio Light"] = {folder = "Community Skin Case", name = "Studio Light"},
+    ["Subspace Tripmine"] = {folder = "Community Skin Case", name = "Subspace Tripmine"},
+    ["Swordfish"] = {folder = "Community Skin Case", name = "Swordfish"},
+    ["Tape Measure"] = {folder = "Community Skin Case", name = "Tape Measure"},
+    ["The Ban Hammer"] = {folder = "Community Skin Case", name = "The Ban Hammer"},
+    ["Toaster"] = {folder = "Community Skin Case", name = "Toaster"},
+    ["Torch"] = {folder = "Community Skin Case", name = "Torch"},
+    ["Toy Hammer"] = {folder = "Community Skin Case", name = "Toy Hammer"},
+    ["Traffic Cone"] = {folder = "Community Skin Case", name = "Traffic Cone"},
+    ["Trampoline"] = {folder = "Community Skin Case", name = "Trampoline"},
+    ["Trophy Knife"] = {folder = "Community Skin Case", name = "Trophy Knife"},
+    ["Trumpet"] = {folder = "Community Skin Case", name = "Trumpet"},
+    ["Violin Crossbow"] = {folder = "Community Skin Case", name = "Violin Crossbow"},
+    ["War Horn"] = {folder = "Community Skin Case", name = "War Horn"},
+    ["Wrench"] = {folder = "Community Skin Case", name = "Wrench"}
+}
+
+-- Skin model lookup
+local function findSkinModel(skinName)
+    local directMap = EXACT_SKIN_MAP[skinName]
+    if directMap and vm then
+        local f = vm:FindFirstChild(directMap.folder)
+        if f then
+            local inst = f:FindFirstChild(directMap.name)
+            if inst then return inst end
+            for _, c in ipairs(f:GetChildren()) do
+                if c.Name:lower() == directMap.name:lower() then return c end
+            end
+        end
+    end
+
+    if not vm then return nil end
+    local targetLower = skinName:lower()
+    for _, folder in ipairs(vm:GetChildren()) do
+        if folder.ClassName == "Folder" and folder.Name ~= "Weapons" then
+            local inst = folder:FindFirstChild(skinName)
+            if inst then return inst end
+            for _, c in ipairs(folder:GetChildren()) do
+                if c.Name:lower() == targetLower then return c end
+            end
+        end
+    end
+
+    local norm = targetLower:gsub("[%s%-%'%.]+", "")
+    for _, folder in ipairs(vm:GetChildren()) do
+        if folder.ClassName == "Folder" and folder.Name ~= "Weapons" then
+            for _, c in ipairs(folder:GetChildren()) do
+                if c.Name:lower():gsub("[%s%-%'%.]+", "") == norm then
+                    return c
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Memory swap
+local memoryRestores = {}
+local renamedScripts = {}
+local floatRestores = {}
+
+local ENABLE_MODEL_SWAPS = true
+
+local ENABLE_RIG_FIXES = false
+local ENABLE_SOUND_REPLACEMENT = false
+
+-- Name copies
+local ENABLE_NAME_COPIES = true
+local nameCopies = {}
+-- Writes everything the swaps overwrote to the undo file (see loadUndo).
+local function saveUndo()
+    local function n(v) return v and string.format("%.0f", v) or "-" end
+    local out = {SERVER_KEY}
+    for _, r in ipairs(memoryRestores) do
+        out[#out + 1] = table.concat({"R", n(r.defSlot), n(r.skinSlot), n(r.origDefInst), n(r.origSkinInst),
+            n(r.origDefCtrl), n(r.origSkinCtrl), n(r.defAddr), n(r.skinAddr), n(r.origDefNC), n(r.origSkinNC),
+            n(r.origDefParent), n(r.origSkinParent)}, " ")
+    end
+    for _, c in ipairs(nameCopies) do out[#out + 1] = "N " .. n(c[1]) .. " " .. n(c[2]) end
+    for _, f in ipairs(floatRestores) do out[#out + 1] = "F " .. n(f[1]) .. " " .. string.format("%.9g", f[2]) end
+    pcall(writefile, UNDO_FILE, table.concat(out, "\n") .. "\n")
+end
+-- A name is a pointer to a shared, counted holder (count at +4, text at
+-- +8). A copied pointer gets one more count: without it, destroying the
+-- renamed object on a rejoin or teleport released the holder once too often,
+-- and a common name like "Modules" was freed while Roblox's own UI still used
+-- it (no top bar, menu, chat or player list, and the game's UI shifted down).
+-- The holder the object had before keeps its count, so it's never freed
+-- either; the next run's undo points the object back at it.
+local function copyName(target, nameSource)
+    if not ENABLE_NAME_COPIES or not target or not nameSource then return false end
+    local slot = target.Address + OFF.NameContainer
+    local orig, name = rd(slot), rd(nameSource.Address + OFF.NameContainer)
+    if not orig or not name or orig == 0 or name == 0 then return false end
+    if orig ~= name then
+        local okC, count = pcall(mrd, "int", name + 4)
+        local okN, srcName = pcall(function() return nameSource.Name end)
+        local okT, text = pcall(mrd, "string", name + 8)
+        if not (okC and count and count >= 1 and count < 100000000) then return false end
+        if okN and okT and type(text) == "string" and #srcName > 0 and #srcName <= 15 and text:sub(1, #srcName) ~= srcName then
+            return false
+        end
+        pcall(mwr, "int", name + 4, count + 1)
+        table.insert(nameCopies, {slot, orig})
+        wr(slot, name)
+    end
+    return true
+end
+
+-- Config data
+local ENABLE_SKIN_DATA_SYNC = true
+local skinDataPairs = {}
+
+local configWrapPairs = {}
+
+local configSkybox = {}
+local configSounds = {}
+local configSpoof = {}
+
+local configLighting = {}
+local configTracers = {}
+_G.__RSC_HPBAR_CFG = {} -- [Health Bar]; a global, the main chunk is at its local limit
+_G.__RSC_BTN_CFG = {} -- [Buttons]
+-- Keeps an instance alive while the changer writes to it every frame: the
+-- game frees UI it rebuilds, and writing into freed memory crashes Roblox.
+-- An Instance points to itself at +8 and to its shared_ptr control block at
+-- +0x10 (strong count at +8). Returns the control block for __RSC_RELEASE.
+_G.__RSC_HOLD = function(addr)
+    local okS, me = pcall(memory_read, "uintptr_t", addr + 8)
+    local okC, ctrl = pcall(memory_read, "uintptr_t", addr + 0x10)
+    if not (okS and me == addr and okC and ctrl and ctrl > 0x10000) then return nil end
+    local okU, uses = pcall(memory_read, "int", ctrl + 8)
+    if not okU or not uses or uses < 1 or uses > 100000 then return nil end
+    pcall(memory_write, "int", ctrl + 8, uses + 1)
+    return ctrl
+end
+-- Never down to 0: if the game has let go meanwhile, the object stays (a
+-- small leak) instead of being freed without its destructor running.
+_G.__RSC_RELEASE = function(ctrl)
+    if not ctrl then return end
+    local ok, uses = pcall(memory_read, "int", ctrl + 8)
+    if ok and uses and uses > 1 then pcall(memory_write, "int", ctrl + 8, uses - 1) end
+end
+local configNoHands = {}
+
+local configFinishers, configCharms = {}, {}
+
+-- Swap two instances
+local function swapTwoWay(instA, instB, parentFolder)
+    if not ENABLE_MODEL_SWAPS then return false end
+    if not instA or not instB or not instA.Address or not instB.Address then return false end
+    local a, b = instA.Address, instB.Address
+    if a == b then return false end
+
+    local folderA = instA.Parent or parentFolder
+    local folderB = instB.Parent or parentFolder
+
+    local slotA = findSlotAddress(instA, folderA)
+    local slotB = findSlotAddress(instB, folderB)
+    local origDefNC = rd(a + OFF.NameContainer)
+    local origSkinNC = rd(b + OFF.NameContainer)
+    local origDefParent = rd(a + OFF.Parent)
+    local origSkinParent = rd(b + OFF.Parent)
+
+    local origDefCtrl = slotA and rd(slotA + 8)
+    local origSkinCtrl = slotB and rd(slotB + 8)
+
+    table.insert(memoryRestores, {
+        defSlot = slotA,
+        skinSlot = slotB,
+        origDefInst = a,
+        origSkinInst = b,
+        origDefCtrl = origDefCtrl,
+        origSkinCtrl = origSkinCtrl,
+        defAddr = a,
+        skinAddr = b,
+        origDefNC = origDefNC,
+        origSkinNC = origSkinNC,
+        origDefParent = origDefParent,
+        origSkinParent = origSkinParent
+    })
+
+    if slotA then
+        wr(slotA, b)
+        if origSkinCtrl then wr(slotA + 8, origSkinCtrl) end
+    end
+    if slotB then
+        wr(slotB, a)
+        if origDefCtrl then wr(slotB + 8, origDefCtrl) end
+    end
+    wr(a + OFF.NameContainer, origSkinNC)
+    wr(b + OFF.NameContainer, origDefNC)
+    wr(a + OFF.Parent, origSkinParent)
+    wr(b + OFF.Parent, origDefParent)
+    return true
+end
+
+-- Rig fixes (off)
+local function fixCrossbowRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body")
+    if not b then return end
+    local p = b:FindFirstChild("Primary") or b:FindFirstChild("BodyPrimary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name == "Arch" or c.Name == "String" or c.Name:find("Arrow") or c.Name:find("Bow") or c.Name:find("Wing") then
+            local cp = (c.ClassName == "Model" and (c.PrimaryPart or c:FindFirstChild("Primary") or c:FindFirstChildWhichIsA("BasePart"))) or (c:IsA("BasePart") and c)
+            if cp and cp.Address and cp ~= p then
+                local w = c:FindFirstChild("BodyWeld") or c:FindFirstChild("SkinAttachmentWeld")
+                if not w and p.Address then
+                    local existingMotor = m:FindFirstChildWhichIsA("Motor6D", true)
+                    if existingMotor then
+                        pcall(function() existingMotor.Part0 = p end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function fixBowRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body")
+    if not b then return end
+    local p = b:FindFirstChild("Primary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:find("String") or c.Name:find("Arrow") or c.Name:find("Limb") then
+            if c:IsA("BasePart") and c.Address then
+                local m6d = m:FindFirstChild(c.Name .. "Joint") or m:FindFirstChildWhichIsA("Motor6D", true)
+                if m6d then
+                    pcall(function() m6d.Part0 = p end)
+                end
+            end
+        end
+    end
+end
+
+local function fixRPGRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body")
+    if not b then return end
+    local p = b:FindFirstChild("Primary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:find("Rocket") or c.Name:find("Missile") or c.Name:find("Key") then
+            if c:IsA("BasePart") and c.Address then
+                local m6d = m:FindFirstChildWhichIsA("Motor6D", true)
+                if m6d then
+                    pcall(function() m6d.Part0 = p end)
+                end
+            end
+        end
+    end
+end
+
+local function fixGrenadeRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body") or m
+    local p = b:FindFirstChild("Primary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:find("Pin") or c.Name:find("Ring") or c.Name:find("Lever") or c.Name:find("Cap") then
+            if c:IsA("BasePart") and c.Address then
+                local m6d = m:FindFirstChildWhichIsA("Motor6D", true)
+                if m6d then
+                    pcall(function() m6d.Part0 = p end)
+                end
+            end
+        end
+    end
+end
+
+local function fixGunbladeRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body")
+    if not b then return end
+    local p = b:FindFirstChild("Primary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:find("Blade") or c.Name:find("Sheath") or c.Name:find("Key") then
+            if c:IsA("BasePart") and c.Address then
+                local m6d = m:FindFirstChildWhichIsA("Motor6D", true)
+                if m6d then
+                    pcall(function() m6d.Part0 = p end)
+                end
+            end
+        end
+    end
+end
+
+local function fixKatanaRig(m)
+    if not m then return end
+    local b = m:FindFirstChild("Body")
+    if not b then return end
+    local p = b:FindFirstChild("Primary") or b:FindFirstChildWhichIsA("BasePart")
+    if not p then return end
+    for _, c in ipairs(m:GetChildren()) do
+        if c.Name:find("Sheath") or c.Name:find("Blade") or c.Name:find("Handle") or c.Name:find("Wing") then
+            if c:IsA("BasePart") and c.Address then
+                local m6d = m:FindFirstChildWhichIsA("Motor6D", true)
+                if m6d then
+                    pcall(function() m6d.Part0 = p end)
+                end
+            end
+        end
+    end
+end
+
+local function rigSkinModel(m)
+    if not m then return end
+    for _, sub in ipairs(m:GetChildren()) do
+        if sub.ClassName == "Model" then
+            if not sub:FindFirstChild("Primary") then
+                local firstPart = sub:FindFirstChildWhichIsA("BasePart")
+                if firstPart then
+                    pcall(function() sub.PrimaryPart = firstPart end)
+                end
+            else
+                pcall(function() sub.PrimaryPart = sub.Primary end)
+            end
+        end
+    end
+
+    if m:FindFirstChild("Body") and m.Body:FindFirstChild("Primary") then
+        pcall(function() m.PrimaryPart = m.Body.Primary end)
+    elseif not m.PrimaryPart then
+        pcall(function() m.PrimaryPart = m:FindFirstChildWhichIsA("BasePart", true) end)
+    end
+
+    for _, c in ipairs(m:GetChildren()) do
+        local n = c.Name:lower()
+        if n:find("shell") or n:find("%.r") or n:find("%.l") or n:find("sleeve") or n:find("juggle") then
+            if c.ClassName == "Model" then
+                pcall(function() c.Name = "_fake" end)
+            end
+        end
+    end
+end
+
+-- Effects
+local MISC_SPECIAL_MAP = {
+    ["Arch Molotov"] = { BurningEffects = "Arch Molotov", MolotovExplosionEffects = "Arch Molotov", FireHitboxes = "Arch Molotov" },
+    ["Ship In A Bottle"] = { BurningEffects = "Ship In A Bottle", MolotovExplosionEffects = "Ship In A Bottle", FireHitboxes = "Ship In A Bottle" },
+    ["Coffee"] = { BurningEffects = "Coffee", MolotovExplosionEffects = "Coffee", FireHitboxes = "Coffee" },
+    ["Vexed Candle"] = { BurningEffects = "Vexed Candle", MolotovExplosionEffects = "Vexed Candle", FireHitboxes = "Vexed Candle" },
+    ["Lava Lamp"] = { MolotovExplosionEffects = "Lava Lamp", FireHitboxes = "Lava Lamp" },
+    ["Hot Coals"] = { FireHitboxes = "Hot Coals" },
+    ["Arch Katana"] = { DeflectHitEffects = "Arch Katana", DeflectActiveEffects = "Arch Katana" },
+    ["Pixel Katana"] = { DeflectActiveEffects = "Pixel Katana" },
+    ["Keytana"] = { DeflectHitEffects = "Keytana", DeflectActiveEffects = "Keytana" },
+    ["Crystal Katana"] = { DeflectHitEffects = "Crystal Katana", DeflectActiveEffects = "Crystal Katana" },
+    ["New Year Katana"] = { DeflectHitEffects = "New Year Katana", DeflectActiveEffects = "New Year Katana" },
+    ["Stellar Katana"] = { DeflectHitEffects = "Stellar Katana", DeflectActiveEffects = "Stellar Katana" },
+    ["Evil Trident"] = { DeflectHitEffects = "Evil Trident", DeflectActiveEffects = "Evil Trident" },
+    ["Saber"] = { DeflectHitEffects = "Saber", DeflectActiveEffects = "Saber" },
+    ["Lightning Bolt"] = { DeflectHitEffects = "Lightning Bolt", DeflectActiveEffects = "Lightning Bolt" },
+    ["Riptide Katana"] = { DeflectHitEffects = "Riptide Katana", DeflectActiveEffects = "Riptide Katana" },
+    ["Keythrower"] = { BurningEffects = "Keythrower", FlamethrowerFlames = "Keythrower", FlamethrowerAirblasts = "Keythrower" },
+    ["Pixel Flamethrower"] = { BurningEffects = "Pixel Flamethrower", FlamethrowerFlames = "Pixel Flamethrower", FlamethrowerAirblasts = "Pixel Flamethrower" },
+    ["Jack O'Thrower"] = { BurningEffects = "Jack O'Thrower", FlamethrowerFlames = "Jack O'Thrower" },
+    ["Snowblower"] = { BurningEffects = "Snowblower", FlamethrowerFlames = "Snowblower" },
+    ["Rainbowthrower"] = { BurningEffects = "Rainbowthrower", FlamethrowerFlames = "Rainbowthrower" },
+    ["Glitterthrower"] = { BurningEffects = "Glitterthrower", FlamethrowerFlames = "Glitterthrower" },
+    ["Extinguisher"] = { BurningEffects = "Extinguisher", FlamethrowerFlames = "Extinguisher" },
+    ["Bubblethrower"] = { BurningEffects = "Bubblethrower", FlamethrowerFlames = "Bubblethrower" },
+    ["Temporal Ray"] = { FreezeEffects = "Temporal" },
+    ["Bubble Ray"] = { FreezeEffects = "Bubble" },
+    ["Spider Ray"] = { FreezeEffects = "Cocoon" },
+    ["Wrapped Freeze Ray"] = { FreezeEffects = "Wrapped" },
+    ["Gum Ray"] = { FreezeEffects = "Gum" },
+    ["Snowglobe"] = { SmokeClouds = "Snowglobe" },
+    ["Emoji Cloud"] = { SmokeClouds = "Emoji Cloud" },
+    ["Balance"] = { SmokeClouds = "Balance" },
+    ["Eyeball"] = { SmokeClouds = "Eyeball" },
+    ["Hourglass"] = { SmokeClouds = "Hourglass" },
+    ["Beach Ball"] = { SmokeClouds = "Beach Ball" },
+    ["Trampoline"] = { JumpPads = "Trampoline" },
+    ["Bounce House"] = { JumpPads = "Bounce House" },
+    ["Shady Chicken Sandwich"] = { JumpPads = "Shady Chicken Sandwich" },
+    ["Glorious Jump Pad"] = { JumpPads = "Glorious Jump Pad" },
+    ["Spider Web"] = { JumpPads = "Spider Web" },
+    ["Jolly Man"] = { JumpPads = "Jolly Man" },
+    ["Electropunk Warper"] = { Portals = "Electropunk Warper" },
+    ["Experiment W4"] = { Portals = "Experiment W4" },
+    ["Glitter Warper"] = { Portals = "Glitter Warper" },
+    ["Frost Warper"] = { Portals = "Frost Warper" },
+    ["Arcane Warper"] = { Portals = "Arcane Warper" },
+    ["Hotel Bell"] = { Portals = "Hotel Bell" },
+    ["Bubbler"] = { Portals = "Bubbler" },
+    ["Experiment D15"] = { Vortexes = "Distortion" },
+    ["Cyber Distortion"] = { Vortexes = "Cyber Distortion" },
+    ["Sleighstortion"] = { Vortexes = "Sleighstortion" },
+    ["Magma Distortion"] = { Vortexes = "Magma Distortion" },
+    ["Plasma Distortion"] = { Vortexes = "Plasma Distortion" },
+    ["Bubble Distortion"] = { Vortexes = "Bubble Distortion" },
+    ["Teleport Disc"] = { BlipEffects = "Teleport Disc" },
+    ["Warpeye"] = { BlipEffects = "Warpeye" },
+    ["Electropunk Warpstone"] = { BlipEffects = "Electropunk Warpstone" },
+    ["Warpstar"] = { BlipEffects = "Warpstar" },
+    ["Warpbone"] = { BlipEffects = "Warpbone" },
+    ["Cyber Warpstone"] = { BlipEffects = "Cyber Warpstone" },
+    ["Wondergun"] = { MuzzleFlashes = "Wondergun" },
+    ["Singularity"] = { MuzzleFlashes = "Singularity" },
+    ["Midnight Festive Exogun"] = { MuzzleFlashes = "Midnight Festive Exogun" },
+    ["Repulsor"] = { MuzzleFlashes = "Repulsor" }
+}
+
+local MISC_EXPLOSIONS_MAP = {
+    Wondergun = "WondergunExplosionParticles",
+    Singularity = "SingularityExplosionParticles",
+    ["Midnight Festive Exogun"] = "MidnightFestiveExogunExplosionParticles",
+    Repulsor = "RepulsorExplosionParticles",
+    Exogourd = "ExogourdExplosionParticles",
+    ["Ray Gun"] = "RayGunExplosionParticles",
+    Advanced = "AdvancedExplosionParticles",
+    ["Cyber Distortion"] = "CyberExplosionParticles",
+    Sleighstortion = "SleighstortionExplosionParticles",
+    ["Magma Distortion"] = "MagmaDistortionExplosionParticles",
+    ["Plasma Distortion"] = "PlasmaDistortionExplosionParticles",
+    ["Experiment D15"] = "ExperimentD15ExplosionParticles",
+    ["Gum Ray"] = "GumRayExplosionEffect",
+    ["Bubble Ray"] = "BubbleRayExplosionEffect",
+    ["Spider Ray"] = "SpiderRayExplosionEffect",
+    ["Temporal Ray"] = "TemporalRayExplosionEffect",
+    ["Wrapped Freeze Ray"] = "WrappedFreezeRayExplosionEffect",
+    RPKEY = "RPKEYExplosionEffect"
+}
+
+local MISC_EXPLOSIONS_BASE = {
+    Exogun = "ExogunExplosionParticles",
+    Distortion = "DistortionExplosionParticles",
+    ["Freeze Ray"] = "FreezeRayExplosionEffect",
+    RPG = "ExplosionEffect"
+}
+
+-- Scopes. The game picks these by the viewmodel's name (Mouse.Scope._Setup),
+-- which is the owned skin in swap mode and the weapon in switch mode, so the
+-- target's images are written over whatever it chose.
+local SCOPE_RETICLES = {
+    Sniper = {
+        blur = "rbxassetid://13466088854",
+        circle = "rbxassetid://13466076605"
+    },
+    ["Pixel Sniper"] = {
+        blur = "rbxassetid://18171031143",
+        circle = "rbxassetid://18171045114"
+    },
+    Keyper = {
+        blur = "rbxassetid://129335242148588",
+        circle = "rbxassetid://81498448678518"
+    }
+}
+-- weapon -> {target skin, owned skin or nil}, for weapons with a scope.
+local scopeSkins = {}
+
+
+local _scriptAlive = true
+
+-- Sound callbacks (off)
+local ACTIVE_CONFIG_SKINS = {}
+
+local ENABLE_SOUND_CALLBACKS = false
+
+local function applySoundCallbacks()
+    if not ENABLE_SOUND_CALLBACKS then return end
+    local rs = game:GetService("ReplicatedStorage")
+    local sc = rs:FindFirstChild("Modules") and rs.Modules:FindFirstChild("AnimationLibrary") and rs.Modules.AnimationLibrary:FindFirstChild("SoundCallbacks")
+    if not sc then return end
+
+    local function pfx(n)
+        return n:lower():gsub("[%s%-%'%.]+", "")
+    end
+
+    local abn = {}
+    for _, c in ipairs(sc:GetChildren()) do
+        abn[c.Name] = c
+    end
+
+    for weaponName, skinTarget in pairs(ACTIVE_CONFIG_SKINS) do
+        local wp = pfx(weaponName)
+        local sp = pfx(skinTarget)
+        local spfx = wp .. "_" .. sp .. "_"
+        for name, inst in pairs(abn) do
+            if name:sub(1, #spfx) == spfx then
+                local suffix = name:sub(#spfx + 1)
+                local defInst = abn[wp .. "_" .. suffix]
+
+                if defInst and inst and defInst.Address and inst.Address and defInst.Address ~= inst.Address then
+                    swapTwoWay(defInst, inst, sc)
+                end
+            end
+        end
+    end
+end
+
+-- Live features (off)
+local ENABLE_PERSISTENT_FEATURES = false
+
+local tickJobs = {}
+local function every(interval, fn)
+    table.insert(tickJobs, {interval = interval, acc = 0, fn = fn})
+end
+local tickConn = nil
+if ENABLE_PERSISTENT_FEATURES then
+    tickConn = game:GetService("RunService").RenderStepped:Connect(function(dt)
+        if not _scriptAlive then return end
+        for _, j in ipairs(tickJobs) do
+            j.acc = j.acc + (dt or 1 / 60)
+            if j.acc >= j.interval then
+                j.acc = 0
+                pcall(j.fn)
+            end
+        end
+    end)
+end
+
+do
+    local rs = game:GetService("ReplicatedStorage")
+    every(0.3, function()
+        local tempVM = rs:FindFirstChild("Assets") and rs.Assets:FindFirstChild("Temp") and rs.Assets.Temp:FindFirstChild("ViewModels")
+        if tempVM then
+            for _, activeVM in ipairs(tempVM:GetChildren()) do
+                if activeVM.Name:find(LP.Name) then
+                    local hrp = activeVM:FindFirstChild("HumanoidRootPart")
+                    local isUnequipped = not hrp or hrp.Position.Magnitude < 1
+                    for _, desc in ipairs(activeVM:GetDescendants()) do
+                        if desc.ClassName == "Beam" or desc.ClassName == "ParticleEmitter" or desc.ClassName == "Trail" then
+                            if isUnequipped and desc.Enabled then
+                                desc.Enabled = false
+                            elseif not isUnequipped and not desc.Enabled then
+                                desc.Enabled = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local KATANA_WINGS1_CFS = {
+    CFrame.new(0.0002, 0.7842, 0.3093, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.7051, 0.5293, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.4365, 0.2489, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.5693, 0.4387, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.9033, 0.6045, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 1.1191, 0.5842, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.4941, 0.3402, -0.0000, 0.0000, -1.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -0.0000),
+    CFrame.new(0.0002, 0.8711, 0.4950, 1.0000, 0.0000, 0.0000, 0.0000, 1.0000, 0.0000, 0.0000, 0.0000, 1.0000)
+}
+
+local KATANA_WINGS2_CFS = {
+    CFrame.new(0.0002, 0.7842, -0.2913, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.7051, -0.5112, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.4365, -0.2307, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.5693, -0.4207, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.9033, -0.5864, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 1.1191, -0.5662, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.4941, -0.3221, 0.0000, 0.0000, 1.0000, 0.0000, 1.0000, 0.0000, -1.0000, 0.0000, 0.0000),
+    CFrame.new(0.0002, 0.8711, -0.4769, 1.0000, 0.0000, 0.0000, 0.0000, 1.0000, 0.0000, 0.0000, 0.0000, 1.0000)
+}
+
+local UZI_WING1_CFS = {
+    CFrame.new(0.2378, 0.3091, -0.5935, 0.4226, 0.5825, 0.6943, 0.0000, 0.7661, -0.6428, -0.9063, 0.2716, 0.3237),
+    CFrame.new(0.2371, 0.3089, -0.5945, 0.4226, 0.5825, 0.6943, 0.0000, 0.7661, -0.6428, -0.9063, 0.2716, 0.3237)
+}
+
+local UZI_WING2_CFS = {
+    CFrame.new(-0.2374, 0.3092, -0.5944, -0.4226, 0.5825, 0.6943, -0.0000, 0.7661, -0.6428, -0.9063, -0.2716, -0.3237),
+    CFrame.new(-0.2384, 0.3089, -0.5944, -0.4226, 0.5825, 0.6943, -0.0000, 0.7661, -0.6428, -0.9063, -0.2716, -0.3237)
+}
+
+local lastEquippedWeapon = nil
+local function alignWeaponWings()
+    local fp = workspace:FindFirstChild("ViewModels") and workspace.ViewModels:FindFirstChild("FirstPerson")
+    if not fp then return end
+
+    for _, vmInst in ipairs(fp:GetChildren()) do
+        local wName = vmInst.Name:match("%-%s*(.-)%s*%-") or vmInst.Name:match(LP.Name .. "%s*%-%s*(.-)%s*$")
+        if wName and wName ~= lastEquippedWeapon then
+            lastEquippedWeapon = wName
+        end
+
+        local iv = vmInst:FindFirstChild("ItemVisual")
+        if iv then
+            local body = iv:FindFirstChild("Body") or iv:FindFirstChild("Model")
+            local bp = body and (body:FindFirstChild("Primary") or body:FindFirstChild("BodyPrimary"))
+            if bp then
+                local bcf = bp.CFrame
+
+                local uw1 = iv:FindFirstChild("Wing1")
+                local uw2 = iv:FindFirstChild("Wing2")
+                if uw1 and uw2 then
+                    local idx1 = 1
+                    for _, c in ipairs(uw1:GetChildren()) do
+                        if c.ClassName == "MeshPart" or c.ClassName == "Part" then
+                            local cf = UZI_WING1_CFS[idx1] or UZI_WING1_CFS[2]
+                            if cf then c.CFrame = bcf * cf end
+                            idx1 = idx1 + 1
+                        end
+                    end
+                    local idx2 = 1
+                    for _, c in ipairs(uw2:GetChildren()) do
+                        if c.ClassName == "MeshPart" or c.ClassName == "Part" then
+                            local cf = UZI_WING2_CFS[idx2] or UZI_WING2_CFS[2]
+                            if cf then c.CFrame = bcf * cf end
+                            idx2 = idx2 + 1
+                        end
+                    end
+                end
+
+                local kw1 = iv:FindFirstChild("Wings1")
+                local kw2 = iv:FindFirstChild("Wings2")
+                if kw1 and kw2 then
+                    local idx1 = 1
+                    for _, c in ipairs(kw1:GetChildren()) do
+                        if c.ClassName == "MeshPart" or c.ClassName == "Part" then
+                            local cf = KATANA_WINGS1_CFS[idx1]
+                            if cf then c.CFrame = bcf * cf end
+                            idx1 = idx1 + 1
+                        end
+                    end
+                    local idx2 = 1
+                    for _, c in ipairs(kw2:GetChildren()) do
+                        if c.ClassName == "MeshPart" or c.ClassName == "Part" then
+                            local cf = KATANA_WINGS2_CFS[idx2]
+                            if cf then c.CFrame = bcf * cf end
+                            idx2 = idx2 + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local SOUND_REPLACEMENTS = {
+    ["13236548545"] = { primary = "rbxassetid://17662574783", secondary = "rbxassetid://18764343961" },
+    ["13236548480"] = { primary = "rbxassetid://90757583550672", secondary = "rbxassetid://110122962237431" },
+    ["13455395017"] = { primary = "rbxassetid://18887149414" },
+    ["13236549929"] = { primary = "rbxassetid://18887149414", volume = 0 },
+    ["13236549962"] = { primary = "rbxassetid://18887149414", volume = 0 },
+    ["13270206222"] = { primary = "rbxassetid://17672502566", secondary = "rbxassetid://124463680760542" },
+    ["13270206087"] = { primary = "rbxassetid://77109116351775", volume = 0.8 },
+    ["13455229044"] = { primary = "rbxassetid://113227486192611" },
+    ["13455229188"] = { primary = "rbxassetid://17672502879" },
+    ["13455394948"] = { primary = "rbxassetid://17672502716" },
+    ["13269929260"] = { primary = "rbxassetid://17672502716" },
+    ["13269934368"] = { primary = "rbxassetid://17672502879" },
+    ["13642104835"] = { primary = "rbxassetid://113227486192611", secondary = "rbxassetid://17672502879" },
+    ["14417089307"] = { primary = "rbxassetid://104731232227748", secondary = "rbxassetid://13483008798" },
+    ["14417089152"] = { primary = "rbxassetid://104731232227748", volume = 0 },
+    ["14417088974"] = { primary = "rbxassetid://104731232227748", volume = 0 },
+    ["13087405232"] = { primary = "rbxassetid://104731232227748", secondary = "rbxassetid://14457782622" },
+    ["14240943641"] = { primary = "rbxassetid://14457783670" },
+    ["14240944488"] = { primary = "rbxassetid://14457783670", volume = 0 },
+    ["14240944327"] = { primary = "rbxassetid://14457783670", volume = 0 },
+    ["13087406981"] = { primary = "rbxassetid://14457783670" },
+    ["82715240396507"] = { primary = "rbxassetid://81230732872783" },
+    ["15132679812"] = { primary = "rbxassetid://81230732872783" },
+    ["13682532502"] = { primary = "rbxassetid://114610550422028" },
+    ["76155503538875"] = { primary = "rbxassetid://114610550422028", volume = 0 },
+    ["15132681423"] = { primary = "rbxassetid://114610550422028" },
+    ["13087410000"] = { primary = "rbxassetid://13087362838", secondary = "rbxassetid://90757583550672" },
+    ["13160326139"] = { primary = "rbxassetid://110122962237431", secondary = "rbxassetid://71387264231358" },
+    ["96886470957330"] = { primary = "rbxassetid://135836738518083", secondary = "rbxassetid://115657023572170" },
+    ["13479562219"] = { primary = "rbxassetid://115657023572170", secondary = "rbxassetid://96253147006478" },
+    ["13515046921"] = { primary = "rbxassetid://96253147006478", volume = 0.5 },
+    ["13515046988"] = { primary = "rbxassetid://96253147006478", volume = 0.5 },
+    ["14522189766"] = { primary = "rbxassetid://96253147006478", secondary = "rbxassetid://14522189766" },
+    ["13158735106"] = { primary = "rbxassetid://18179281854" },
+    ["16526185100"] = { primary = "rbxassetid://16526185100", secondary = "rbxassetid://90757583550672" },
+    ["16526184479"] = { primary = "rbxassetid://16526184479", secondary = "rbxassetid://110122962237431" },
+    ["13744359504"] = { primary = "rbxassetid://110122962237431" },
+    ["17209245734"] = { primary = "rbxassetid://17209245734", secondary = "rbxassetid://129124742663895" },
+    ["90757583550672"] = { primary = "rbxassetid://90757583550672" },
+    ["14812827622"] = { primary = "rbxassetid://72790275842437" },
+    ["14812827928"] = { primary = "rbxassetid://72790275842437" },
+    ["10730819"] = { primary = "rbxassetid://10730819" },
+    ["132455961912409"] = { primary = "rbxassetid://132455961912409" },
+    ["13159969353"] = { primary = "rbxassetid://108879620126710", secondary = "rbxassetid://86510987016114" },
+    ["13968137196"] = { primary = "rbxassetid://118906938239363" },
+    ["14776414133"] = { primary = "rbxassetid://86510987016114" },
+    ["14776437962"] = { primary = "rbxassetid://14000023581" },
+    ["82797934287631"] = { primary = "rbxassetid://82797934287631" },
+}
+
+local function hookSound(sound)
+    if not sound or sound.ClassName ~= "Sound" then return end
+    local id = sound.SoundId:match("%d+")
+    if not id then return end
+    local repl = SOUND_REPLACEMENTS[id] or SOUND_REPLACEMENTS["rbxassetid://" .. id]
+    if repl then
+        sound.SoundId = repl.primary
+        if repl.volume then sound.Volume = repl.volume end
+        if repl.pitch then sound.PlaybackSpeed = repl.pitch end
+    end
+end
+
+local soundConnections = {}
+pcall(function()
+    if not ENABLE_SOUND_REPLACEMENT then return end
+    local ss = game:GetService("SoundService")
+    if ss then
+        for _, s in ipairs(ss:GetDescendants()) do
+            if s.ClassName == "Sound" then hookSound(s) end
+        end
+        if not ENABLE_PERSISTENT_FEATURES then return end
+        table.insert(soundConnections, ss.DescendantAdded:Connect(function(s)
+            if s.ClassName == "Sound" then hookSound(s) end
+        end))
+    end
+    table.insert(soundConnections, workspace.DescendantAdded:Connect(function(s)
+        if s.ClassName == "Sound" then hookSound(s) end
+    end))
+end)
+
+every(0.1, function()
+    local fp = workspace:FindFirstChild("ViewModels") and workspace.ViewModels:FindFirstChild("FirstPerson")
+    if fp then
+        for _, vmInst in ipairs(fp:GetChildren()) do
+            for _, s in ipairs(vmInst:GetDescendants()) do
+                if s.ClassName == "Sound" then hookSound(s) end
+            end
+        end
+    end
+end)
+
+local sampleAnimInstance = nil
+local function getSampleAnim()
+    if sampleAnimInstance and sampleAnimInstance.Parent then return sampleAnimInstance end
+    for _, d in ipairs(LP:GetDescendants()) do
+        if d.ClassName == "Animation" then sampleAnimInstance = d return d end
+    end
+    local rs = game:GetService("ReplicatedStorage")
+    for _, d in ipairs(rs:GetDescendants()) do
+        if d.ClassName == "Animation" then sampleAnimInstance = d return d end
+    end
+    return nil
+end
+
+local function playCustomTrack(animator, assetId, speed)
+    local sample = getSampleAnim()
+    if not animator or not sample then return nil end
+    local a = sample:Clone()
+    a.AnimationId = assetId
+    local ok, track = pcall(animator.LoadAnimation, animator, a)
+    if ok and track then
+        track:Play(0.1, 1, speed or 1)
+        return track
+    end
+    return nil
+end
+
+local uisConn = nil
+pcall(function()
+    if not ENABLE_PERSISTENT_FEATURES then return end
+    local uis = game:GetService("UserInputService")
+    uisConn = uis.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        local fp = workspace:FindFirstChild("ViewModels") and workspace.ViewModels:FindFirstChild("FirstPerson")
+        if not fp then return end
+        for _, vmInst in ipairs(fp:GetChildren()) do
+            local wName = vmInst.Name:match("%-%s*(.-)%s*%-") or vmInst.Name:match(LP.Name .. "%s*%-%s*(.-)%s*$")
+            local ac = vmInst:FindFirstChild("AnimationController") or vmInst:FindFirstChildWhichIsA("AnimationController")
+            local animator = ac and (ac:FindFirstChild("Animator") or ac:FindFirstChildWhichIsA("Animator"))
+
+            if wName == "Sniper" and animator then
+                if input.KeyCode == Enum.KeyCode.R then
+                    playCustomTrack(animator, "rbxassetid://121991964753861", 1.43)
+                elseif input.KeyCode == Enum.KeyCode.F then
+                    playCustomTrack(animator, "rbxassetid://89426100452654", 1)
+                end
+            elseif wName == "Katana" and animator then
+                if input.KeyCode == Enum.KeyCode.F then
+                    playCustomTrack(animator, "rbxassetid://119980219668284", 1)
+                end
+            end
+        end
+    end)
+end)
+
+-- Notifications
+local function notifyUser(title, text, duration)
+    duration = duration or 8
+    if typeof(notify) == "function" then
+        pcall(notify, text, title, duration)
+    end
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration
+        })
+    end)
+end
+
+-- Config
+local function parseSkinSwapLine(rawLine)
+    local l = rawLine:gsub(string.char(13), "")
+    if l:match("^%s*%-%-") then return nil end
+    local w, o, t = l:match("^%s*([^|]-)%s*|%s*([^>]-)%s*>%s*(.-)%s*$")
+    if w and o and t and #w > 0 and #o > 0 and #t > 0 and o ~= t then return w, o, t end
+end
+
+local function parseConfigLine(rawLine)
+    local l = rawLine:gsub(string.char(13), ""):gsub(string.char(10), ""):match("^%s*(.-)%s*$")
+    if not l or #l == 0 or l:sub(1, 2) == "--" or l:sub(1, 1) == "#" or l == "return {" or l == "}" then
+        return nil, nil
+    end
+
+    local sep = l:find("=") or l:find(":")
+    if not sep then return nil, nil end
+
+    local w = l:sub(1, sep - 1):match("^%s*(.-)%s*$")
+    local s = l:sub(sep + 1):match("^%s*(.-)%s*$")
+    if not w or not s then return nil, nil end
+
+    s = s:gsub("[,;]+$", ""):match("^%s*(.-)%s*$")
+
+    w = w:gsub('^%["', ''):gsub('"%]$', ''):gsub("^%['", ''):gsub("'%]$", ''):gsub('^%[', ''):gsub('%]$', '')
+
+    w = w:gsub('^"', ''):gsub('"$', ''):gsub("^'", ''):gsub("'$", ''):match("^%s*(.-)%s*$")
+    s = s:gsub('^"', ''):gsub('"$', ''):gsub("^'", ''):gsub("'$", ''):match("^%s*(.-)%s*$")
+
+    if w and s and #w > 0 and #s > 0 then
+        return w, s
+    end
+    return nil, nil
+end
+
+-- Lua table reading
+local NODE_SIZE, NODE_KEY, STRING_DATA = 32, 16, 24
+
+local function nodeKey(node)
+    local kp = rd(node + NODE_KEY)
+    if not kp or kp < 0x10000 then return nil end
+    local ok, str = pcall(mrd, "string", kp + STRING_DATA)
+    if ok and type(str) == "string" and #str > 0 and #str < 80 then return str end
+end
+
+-- 2^lsizenode is the real node count; walking past it reads other tables'
+-- nodes and can match a foreign entry with the same key. Which header byte
+-- holds it depends on the Roblox build (found by the registry route below).
+local function nodeCount(t)
+    if not t or t < 0x10000 then return nil end
+    local layout = _G.__RSC_LAYOUT
+    local ok, l = pcall(mrd, "byte", t + (layout and layout.lsize or 4))
+    if not ok or not l or l < 0 or l > 20 then return nil end
+    return 2 ^ l
+end
+
+local function walkNodes(base, maxNodes, wanted)
+    local found, n, readable, want = {}, 0, 0, 0
+    for _ in pairs(wanted) do want = want + 1 end
+    for i = 0, maxNodes - 1 do
+        local node = base + i * NODE_SIZE
+        local k = nodeKey(node)
+        if k then
+            readable = readable + 1
+
+            if wanted[k] and not found[k] then
+                local okT, tt = pcall(mrd, "int", node + 12)
+                if okT and tt ~= 0 then found[k], n = node, n + 1 end
+            end
+        end
+        if n == want then break end
+        if i == 63 and readable == 0 then break end
+    end
+    return found, n
+end
+
+local function tableFields(t, maxNodes, wanted)
+    if not t or t < 0x10000 then return nil, 0 end
+    maxNodes = math.min(maxNodes, nodeCount(t) or maxNodes)
+    local best, bestN, bestBase = nil, 0, nil
+    for off = 0, 56, 8 do
+        local base = rd(t + off)
+        if base and base > 0x10000 then
+            local found, n = walkNodes(base, maxNodes, wanted)
+            if n > bestN then best, bestN, bestBase = found, n, base end
+        end
+    end
+    return best, bestN, bestBase
+end
+
+local VM_ANCHOR, COS_ANCHOR = {["Assault Rifle"] = true}, {["Glass"] = true}
+
+local SCAN_KEY = "AK-47"
+
+local function walkAround(center, span, wanted)
+    local found, n = {}, 0
+    local function visit(node)
+        local k = nodeKey(node)
+        if k and wanted[k] and not found[k] then
+
+            local okT, tt = pcall(mrd, "int", node + 12)
+            if okT and tt ~= 0 then found[k], n = node, n + 1 end
+        end
+    end
+    visit(center)
+    for i = 1, span do
+        visit(center + i * NODE_SIZE)
+        visit(center - i * NODE_SIZE)
+    end
+    return found, n
+end
+
+-- Registry route
+-- Roblox reshuffles Luau's object layout between builds: which header byte
+-- holds an object's type (tt), which holds a table's lsizenode, and where a
+-- thread keeps its global state. Build 02c37bc (Sep 30 2026) had tt +1,
+-- lsizenode +4, global state +0x68; cec3ad5 (Oct 2026) moved tt back to +0.
+-- So they are found at runtime (ROUTE.detect) instead of being hard-coded.
+local ROUTE = {thread = 0x170, slot = 0x178, globalState = 0x68, registry = 0x620, node = 0x18, array = 0x20,
+    sizearray = 8, tt = 1, lsize = 4}
+local TAG_TABLE, TAG_THREAD = 7, 10
+
+local function rbyte(a) local ok, v = pcall(mrd, "byte", a) return ok and v or nil end
+local function rint(a) local ok, v = pcall(mrd, "int", a) return ok and v or nil end
+
+-- Finds tt, the global-state offset, the registry offset and lsizenode from
+-- one module: its thread's header says where tt is; the right global state
+-- leads to a registry whose slot for this module holds a table.
+ROUTE.detect = function(ms)
+    -- What was seen, for the debug copy ("why did detection fail").
+    local trace = {}
+    _G.__RSC_ROUTE_TRACE = trace
+    local thread = rd(ms.Address + ROUTE.thread)
+    local slot = rint(ms.Address + ROUTE.slot)
+    if not thread or thread < 0x10000 or not slot or slot < 1 then trace.stop = "no thread/slot on the module" return false end
+    local tt
+    for b = 0, 3 do if rbyte(thread + b) == TAG_THREAD then tt = b break end end
+    if not tt then trace.stop = "no thread tag in the thread header" return false end
+    trace.tt, trace.slot, trace.pointers, trace.tagged, trace.arrays = tt, slot, 0, 0, 0
+    -- A table's array: a size and a pointer somewhere in its first 0x30
+    -- bytes; the right pair has a table TValue (tag at +12) in this slot.
+    local function arrayOf(reg)
+        for _, so in ipairs({ROUTE.sizearray or 8, 8, 12, 4}) do
+            local size = rint(reg + so)
+            if size and size >= slot and size < 10000000 then
+                for _, ao in ipairs({ROUTE.array, 0x20, 0x18, 0x28, 0x10}) do
+                    local arr = rd(reg + ao)
+                    if arr and arr > 0x10000 and arr < 0x7fffffffffff and rint(arr + (slot - 1) * 16 + 12) == TAG_TABLE then
+                        local t = rd(arr + (slot - 1) * 16)
+                        if t and t > 0x10000 and rbyte(t + tt) == TAG_TABLE then return t, so, ao end
+                    end
+                end
+            end
+        end
+    end
+    local function nodesOfTable(t)
+        -- A table's nodes: a pointer and a size byte (lsizenode) that lead to
+        -- string keys. Its mask (2^l - 1) sat right after it until Roblox build
+        -- 11f155f3 (Oct 2026) moved the two apart, so any other header byte may
+        -- hold the mask. The pair whose nodes are well filled with string keys,
+        -- and that finds the most, wins (walking too many nodes would read other
+        -- tables' memory, which a fill check catches).
+        local bestKeys, bestNo, bestB = 0, nil, nil
+        for _, no in ipairs({ROUTE.node, 0x18, 0x20, 0x10, 0x28}) do
+            local base = rd(t + no)
+            if base and base > 0x10000 and base < 0x7fffffffffff then
+                for _, b in ipairs({tt == 0 and 6 or 4, 3, 4, 6, 5, 7, 2}) do
+                    local l = rbyte(t + b)
+                    local masked = false
+                    if l and l >= 1 and l <= 24 then
+                        for mb = 1, 7 do
+                            if mb ~= b and rbyte(t + mb) == (2 ^ l - 1) % 256 then masked = true break end
+                        end
+                    end
+                    if masked then
+                        local keys, count = 0, math.min(2 ^ l, 256)
+                        for i = 0, count - 1 do
+                            local n = base + i * 32
+                            local kp = rd(n + 16)
+                            if (rint(n + 28) or 0) % 16 == 6 and kp and kp > 0x10000 then
+                                local ok, k = pcall(mrd, "string", kp + 24)
+                                if ok and type(k) == "string" and #k > 0 and #k < 64 then keys = keys + 1 end
+                            end
+                        end
+                        if keys > bestKeys and keys >= count / 4 then bestKeys, bestNo, bestB = keys, no, b end
+                    end
+                end
+            end
+        end
+        if bestNo then return bestNo, bestB end
+    end
+    local function tryAt(g, x, y)
+        local reg = rd(g + y)
+        if not reg or reg < 0x10000 or rint(g + y + 12) ~= TAG_TABLE or rbyte(reg + tt) ~= TAG_TABLE then return false end
+        trace.tagged = trace.tagged + 1
+        local t, so, ao = arrayOf(reg)
+        if not t then return false end
+        trace.arrays = trace.arrays + 1
+        local no, lsize = nodesOfTable(t)
+        if not no then trace.stop = "module table found but its nodes weren't" return false end
+        ROUTE.tt, ROUTE.globalState, ROUTE.registry, ROUTE.lsize = tt, x, y, lsize
+        ROUTE.sizearray, ROUTE.array, ROUTE.node, ROUTE.ok = so, ao, no, true
+        _G.__RSC_LAYOUT = {tt = tt, globalState = x, registry = y, lsize = lsize, sizearray = so, array = ao, node = no}
+        print(string.format("[RivalsSkinChanger] Memory layout: type byte +%d, global state +0x%x, registry +0x%x, size byte +%d, array +0x%x/+%d, nodes +0x%x",
+            tt, x, y, lsize, ao, so, no))
+        return true
+    end
+    local xs = {ROUTE.globalState, 0x18, 0x68}
+    for x = 0, 0x100, 8 do xs[#xs + 1] = x end
+    -- The registry has sat at +0x620 for a long time: try that first, and
+    -- the whole global state only now and then (it is a few thousand reads).
+    local full = not ROUTE.nextFull or tick() >= ROUTE.nextFull
+    if full then ROUTE.nextFull = tick() + 10 end
+    for pass = 1, full and 2 or 1 do
+        for _, x in ipairs(xs) do
+            local g = rd(thread + x)
+            if g and g > 0x10000 and g < 0x7fffffffffff then
+                if pass == 1 then trace.pointers = trace.pointers + 1 end
+                if pass == 1 then
+                    if tryAt(g, x, ROUTE.registry) then return true end
+                else
+                    for y = 0, 0x1000, 8 do
+                        if tryAt(g, x, y) then return true end
+                    end
+                end
+            end
+        end
+    end
+    trace.stop = trace.stop or (trace.arrays > 0 and "registry found, module slot not usable"
+        or (trace.tagged > 0 and "registry-like tables found, but none held this module" or "no registry found"))
+    return false
+end
+
+-- A layout this PC learned for the running Roblox build, kept in a file.
+-- When ROUTE.detect can't read a new build but the slow scan still finds
+-- the item tables, ROUTE.learn works the layout out from what the scan found
+-- and saves it, so the next run on this build is fast again.
+ROUTE.FIELDS = {"tt", "globalState", "registry", "lsize", "sizearray", "array", "node"}
+ROUTE.savedFile = function()
+    local okV, v = pcall(function() return getrbxversion() end)
+    return "rivals_layout_" .. ((okV and type(v) == "string" and v:match("[%w%-]+")) or "unknown") .. ".json"
+end
+ROUTE.apply = function(lay, from)
+    for _, k in ipairs(ROUTE.FIELDS) do ROUTE[k] = lay[k] end
+    ROUTE.ok = true
+    _G.__RSC_LAYOUT = {tt = lay.tt, globalState = lay.globalState, registry = lay.registry, lsize = lay.lsize,
+        sizearray = lay.sizearray, array = lay.array, node = lay.node}
+    print(string.format("[RivalsSkinChanger] Memory layout (%s): type byte +%d, global state +0x%x, registry +0x%x, size byte +%d, array +0x%x/+%d, nodes +0x%x",
+        from, lay.tt, lay.globalState, lay.registry, lay.lsize, lay.array, lay.sizearray, lay.node))
+end
+-- The module table a layout leads to, or nil.
+ROUTE.tableWith = function(ms, lay)
+    local thread = rd(ms.Address + ROUTE.thread)
+    local slot = rint(ms.Address + ROUTE.slot)
+    if not thread or thread < 0x10000 or not slot or slot < 1 or rbyte(thread + lay.tt) ~= TAG_THREAD then return nil end
+    local g = rd(thread + lay.globalState)
+    local reg = g and g > 0x10000 and rd(g + lay.registry)
+    if not reg or reg < 0x10000 or rint(g + lay.registry + 12) ~= TAG_TABLE or rbyte(reg + lay.tt) ~= TAG_TABLE then return nil end
+    local size, arr = rint(reg + lay.sizearray), rd(reg + lay.array)
+    if not size or not arr or arr < 0x10000 or slot > size or rint(arr + (slot - 1) * 16 + 12) ~= TAG_TABLE then return nil end
+    local t = rd(arr + (slot - 1) * 16)
+    return t and t > 0x10000 and rbyte(t + lay.tt) == TAG_TABLE and t or nil
+end
+-- The value under a string key in table t, walking its nodes with lay.
+ROUTE.valueOf = function(t, lay, key)
+    local base, l = rd(t + lay.node), rbyte(t + lay.lsize)
+    if not base or base < 0x10000 or not l or l < 1 or l > 16 then return nil end
+    for i = 0, 2 ^ l - 1 do
+        local n = base + i * 32
+        local kp = rd(n + 16)
+        if (rint(n + 28) or 0) % 16 == 6 and kp and kp > 0x10000 then
+            local ok, k = pcall(mrd, "string", kp + 24)
+            if ok and k == key then return rd(n) end
+        end
+    end
+end
+ROUTE.useSaved = function(ms)
+    if ROUTE.triedSaved then return false end
+    ROUTE.triedSaved = true
+    local okF, raw = pcall(function() local f = ROUTE.savedFile() return isfile(f) and readfile(f) or nil end)
+    if not okF or type(raw) ~= "string" then return false end
+    local okJ, lay = pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
+    if not okJ or type(lay) ~= "table" then return false end
+    for _, k in ipairs(ROUTE.FIELDS) do if type(lay[k]) ~= "number" then return false end end
+    local t = ROUTE.tableWith(ms, lay)
+    if not t or not ROUTE.valueOf(t, lay, "ViewModels") then
+        print("[RivalsSkinChanger] The saved memory layout for this Roblox build no longer fits - looking again")
+        return false
+    end
+    ROUTE.apply(lay, "saved on this PC")
+    return true
+end
+-- nodes: addresses the slow scan found that may be nodes of
+-- ItemLibrary.ViewModels (several tables share its keys, so there are usually
+-- a few). A layout candidate counts only if it leads from the module's
+-- registry slot to the "ViewModels" table and one of these exact nodes.
+ROUTE.learn = function(ms, nodes)
+    if ROUTE.ok or not ms or type(nodes) ~= "table" or #nodes == 0 then return false end
+    local thread = rd(ms.Address + ROUTE.thread)
+    if not thread or thread < 0x10000 then return false end
+    local tts = {}
+    for b = 0, 3 do if rbyte(thread + b) == TAG_THREAD then tts[#tts + 1] = b end end
+    local steps = 0
+    local function fits(lay)
+        steps = steps + 1
+        if steps % 400 == 0 then pcall(task.wait) end
+        local t = ROUTE.tableWith(ms, lay)
+        if not t then return false end
+        for _, no in ipairs({0x18, 0x20, 0x10, 0x28, 0x30, 0x8}) do
+            for b = 2, 7 do
+                lay.node, lay.lsize = no, b
+                local d = ROUTE.valueOf(t, lay, "ViewModels")
+                if d and d > 0x10000 and rbyte(d + lay.tt) == TAG_TABLE then
+                    local base, l = rd(d + no), rbyte(d + b)
+                    if base and l and l >= 1 and l <= 16 then
+                        for _, node in ipairs(nodes) do
+                            if node >= base and node < base + 32 * 2 ^ l and (node - base) % 32 == 0 then return true end
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end
+    for _, tt in ipairs(tts) do
+        for pass = 1, 2 do
+            for x = 0, 0x100, 8 do
+                local g = rd(thread + x)
+                if g and g > 0x10000 and g < 0x7fffffffffff then
+                    local ys = {0x620}
+                    if pass == 2 then ys = {} for y = 0, 0x1000, 8 do ys[#ys + 1] = y end end
+                    for _, y in ipairs(ys) do
+                        if rint(g + y + 12) == TAG_TABLE then
+                            for _, so in ipairs({8, 12, 4}) do
+                                for _, ao in ipairs({0x20, 0x18, 0x28, 0x10, 0x30}) do
+                                    local lay = {tt = tt, globalState = x, registry = y, sizearray = so, array = ao}
+                                    if fits(lay) then
+                                        ROUTE.apply(lay, "learned from the slow scan")
+                                        local okW = pcall(writefile, ROUTE.savedFile(),
+                                            game:GetService("HttpService"):JSONEncode(lay))
+                                        print("[RivalsSkinChanger] " .. (okW and ("Saved it as " .. ROUTE.savedFile() .. " - the next run on this Roblox build is fast again")
+                                            or "Couldn't save the learned layout"))
+                                        return true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    print("[RivalsSkinChanger] Couldn't work out the memory layout from the slow scan either")
+    return false
+end
+
+local function moduleTable(ms)
+    if not ms or not ms.Address then return nil end
+    if not ROUTE.ok then ROUTE.useSaved(ms) end
+    if not ROUTE.ok then ROUTE.detect(ms) end
+    local GC_TT = ROUTE.tt
+    local thread = rd(ms.Address + ROUTE.thread)
+    if not thread or thread < 0x10000 or rbyte(thread + GC_TT) ~= TAG_THREAD then return nil end
+    local g = rd(thread + ROUTE.globalState)
+    local reg = g and g > 0x10000 and rd(g + ROUTE.registry)
+    if not reg or reg < 0x10000 or rbyte(reg + GC_TT) ~= TAG_TABLE or rint(g + ROUTE.registry + 12) ~= TAG_TABLE then return nil end
+    local slot, size, arr = rint(ms.Address + ROUTE.slot), rint(reg + ROUTE.sizearray), rd(reg + ROUTE.array)
+    if not slot or not size or not arr or slot < 1 or slot > size then return nil end
+    local t = rd(arr + (slot - 1) * 16)
+    if not t or t < 0x10000 or rbyte(t + GC_TT) ~= TAG_TABLE then return nil end
+    return t
+end
+
+local function nodesOf(t, maxNodes, wanted)
+    local base = t and t > 0x10000 and rbyte(t + ROUTE.tt) == TAG_TABLE and rd(t + ROUTE.node)
+    if not base or base < 0x10000 then return nil end
+    local count = math.min(maxNodes, nodeCount(t) or maxNodes)
+    local found, n = walkNodes(base, count, wanted)
+    return found, n, base, count
+end
+
+local function dictionariesViaRegistry(wantVm, wantCos)
+    local mods = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+    local vm, cos, vmBase, cosBase, vmCount, cosCount
+    if wantVm then
+        local f = nodesOf(moduleTable(mods and mods:FindFirstChild("ItemLibrary")), 256, {ViewModels = true, ViewModelOrder = true})
+        local dict = f and f.ViewModels and f.ViewModelOrder and rd(f.ViewModels)
+        local d, _, base, count = nodesOf(dict, 8192, VM_ANCHOR)
+        if d and d["Assault Rifle"] then vm, vmBase, vmCount = d["Assault Rifle"], base, count end
+    end
+    if wantCos then
+        local f = nodesOf(moduleTable(mods and mods:FindFirstChild("CosmeticLibrary")), 256, {Cosmetics = true})
+        local dict = f and f.Cosmetics and rd(f.Cosmetics)
+        local d, _, base, count = nodesOf(dict, 16384, COS_ANCHOR)
+        if d and d["Glass"] then cos, cosBase, cosCount = d["Glass"], base, count end
+    end
+    return vm, cos, vmBase, cosBase, vmCount, cosCount
+end
+
+-- Item dictionaries
+local function findDictionaries(cache, needVm, needCos)
+    local vm, cos = nil, nil
+
+    local forceScan = cache.forceScan
+    if not forceScan then
+        if needVm and cache.vm and select(2, walkAround(cache.vm, 2048, VM_ANCHOR)) > 0 then vm = cache.vm end
+        if needCos and cache.cos and select(2, walkAround(cache.cos, 4096, COS_ANCHOR)) > 0 then cos = cache.cos end
+        if (vm or not needVm) and (cos or not needCos) then
+            cache.route = "cache"
+            return vm, cos
+        end
+    end
+
+    local okR, rvm, rcos, rvmBase, rcosBase, rvmCount, rcosCount = false, nil, nil, nil, nil, nil, nil
+    if not forceScan then
+        okR, rvm, rcos, rvmBase, rcosBase, rvmCount, rcosCount =
+            pcall(dictionariesViaRegistry, needVm and not vm, needCos and not cos)
+    end
+    if okR then
+        if rvm then vm, cache.vmBase, cache.vmCount = rvm, rvmBase, rvmCount end
+        if rcos then cos, cache.cosBase, cache.cosCount = rcos, rcosBase, rcosCount end
+    end
+    if (vm or not needVm) and (cos or not needCos) then
+        cache.vm, cache.cos = vm or cache.vm, cos or cache.cos
+        cache.route = "registry"
+        return vm, cos
+    end
+
+    cache.route, cache.vmBase, cache.cosBase, cache.vmCount, cache.cosCount = "scan", nil, nil, nil, nil
+
+    local job = game.JobId
+    local okG, rows = pcall(getgc, {SCAN_KEY})
+    local learnFrom = {}
+
+    if game.JobId ~= job then return nil, nil, "server changed during the scan" end
+    for _, r in ipairs(okG and type(rows) == "table" and rows or {}) do
+        -- Every match is a candidate for learning the layout: checking its
+        -- fields needs the layout, and learning checks each one strictly.
+        learnFrom[#learnFrom + 1] = r.addr
+        local f = tableFields(rd(r.addr), 32, {Animations = true, Rarity = true, Type = true})
+        if f and f.Animations then
+            if needVm and not vm and select(2, walkAround(r.addr, 2048, VM_ANCHOR)) > 0 then vm = r.addr end
+        elseif f and f.Rarity and f.Type then
+            if needCos and not cos and select(2, walkAround(r.addr, 4096, COS_ANCHOR)) > 0 then cos = r.addr end
+        end
+    end
+
+    if (needVm and not vm) or (needCos and not cos) then
+        if game.JobId ~= job then return nil, nil, "server changed during the scan" end
+        local okF, frows = pcall(getgc, {"ViewModels", "Cosmetics"})
+        for _, r in ipairs(okF and type(frows) == "table" and frows or {}) do
+            if r.key == "ViewModels" and needVm and not vm then
+                local f = tableFields(rd(r.addr), 2048, VM_ANCHOR)
+                vm = f and f["Assault Rifle"] or vm
+            elseif r.key == "Cosmetics" and needCos and not cos then
+                local f = tableFields(rd(r.addr), 4096, COS_ANCHOR)
+                cos = f and f["Glass"] or cos
+            end
+        end
+        if game.JobId ~= job then return nil, nil, "server changed during the scan" end
+    end
+    cache.vm, cache.cos = vm or cache.vm, cos or cache.cos
+    -- The fast route failed but the scan found the table: learn the layout
+    -- from it and save it for this Roblox build.
+    if not ROUTE.ok and (vm or #learnFrom > 0) then
+        if vm then learnFrom[#learnFrom + 1] = vm end
+        local mods = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+        local okL, learned = pcall(ROUTE.learn, mods and mods:FindFirstChild("ItemLibrary"), learnFrom)
+        -- With the layout known, take the tables from the fast route: the
+        -- scan's first match is often a copy, not the table the game uses.
+        if okL and learned then
+            local okR2, rvm2, rcos2, rvmBase2, rcosBase2, rvmCount2, rcosCount2 = pcall(dictionariesViaRegistry, needVm, needCos)
+            if okR2 and (rvm2 or not needVm) and (rcos2 or not needCos) then
+                vm, cos = rvm2 or vm, rcos2 or cos
+                cache.vmBase, cache.vmCount, cache.cosBase, cache.cosCount = rvmBase2, rvmCount2, rcosBase2, rcosCount2
+                cache.vm, cache.cos = vm, cos
+                cache.route = "registry"
+            end
+        end
+    end
+    return vm, cos, (not okG) and "gc scan failed" or nil
+end
+
+local VM_FIELDS = {Animations = true, RootPartOffset = true, Image = true, ImageHighResolution = true}
+local WRAP_FIELDS = {WrapGroups = true}
+
+-- Animations, offsets, icons, wraps
+local function syncSkinData(pairList, wrapPairs, cache)
+    if #pairList == 0 and #wrapPairs == 0 then return 0 end
+    local vm, cos, err = findDictionaries(cache, #pairList > 0, #wrapPairs > 0)
+    if #pairList > 0 and not vm and #wrapPairs > 0 and not cos then return 0, err or "item dictionaries not found" end
+
+    local vmWanted, cosWanted = {}, {}
+    for _, p in ipairs(pairList) do vmWanted[p[1]], vmWanted[p[2]] = true, true end
+    for _, p in ipairs(wrapPairs) do cosWanted[p[1]], cosWanted[p[2]] = true, true end
+
+    local vmNodes = vm and (cache.vmBase and walkNodes(cache.vmBase, cache.vmCount or 8192, vmWanted) or walkAround(vm, 2048, vmWanted)) or {}
+    local cosNodes = cos and (cache.cosBase and walkNodes(cache.cosBase, cache.cosCount or 16384, cosWanted) or walkAround(cos, 4096, cosWanted)) or {}
+
+    local function viewModelSlots(name)
+        local node = vmNodes[name]
+        local f = node and tableFields(rd(node), 32, VM_FIELDS)
+        if f and f.Animations and f.RootPartOffset then
+            return {f.Animations, f.RootPartOffset, f.Image or false, f.ImageHighResolution or false}
+        end
+    end
+
+    local synced, missed = 0, {}
+    for _, p in ipairs(pairList) do
+        local d, k = viewModelSlots(p[1]), viewModelSlots(p[2])
+        local vals = k and {rd(k[1]), rd(k[2]), k[3] and rd(k[3]), k[4] and rd(k[4])}
+        if d and vals and vals[1] and vals[2] and vals[1] ~= 0 and vals[2] ~= 0 then
+
+            for j = 1, 4 do
+                if d[j] and vals[j] and vals[j] ~= 0 then wr(d[j], vals[j]) end
+            end
+            synced = synced + 1
+        else
+            missed[#missed + 1] = p[2]
+        end
+    end
+
+    local function wrapGroupsSlot(name)
+        local node = cosNodes[name]
+        local f = node and tableFields(rd(node), 32, WRAP_FIELDS)
+        return f and f.WrapGroups
+    end
+    local wrapsApplied, wrapsMissed = 0, {}
+    for _, p in ipairs(wrapPairs) do
+        local ownedSlot, targetSlot = wrapGroupsSlot(p[1]), wrapGroupsSlot(p[2])
+        local targetGroups = targetSlot and rd(targetSlot)
+        if ownedSlot and targetGroups and targetGroups ~= 0 and ownedSlot ~= targetSlot then
+            wr(ownedSlot, targetGroups)
+            wrapsApplied = wrapsApplied + 1
+        else
+            wrapsMissed[#wrapsMissed + 1] = p[1] .. "=" .. p[2]
+        end
+    end
+    local note = (#missed > 0) and ("not found: " .. table.concat(missed, ", ")) or err
+    return synced, note, wrapsApplied, wrapsMissed, missed
+end
+
+-- Skin swaps
+local function applySkinSwapper()
+    if not isfile or not readfile then
+        return 0, "Executor does not support isfile/readfile functions."
+    end
+
+    local candidatePaths = {
+        "rivals_config.lua",
+        "workspace/rivals_config.lua",
+        "rivals_config.lua.txt",
+        "rivals_config.txt",
+        "workspace/rivals_config.txt",
+        "rivals_config (1).lua",
+        "rivals_config(1).lua",
+        "Rivals_Config.lua",
+        "rivals_config"
+    }
+
+    if typeof(listfiles) == "function" then
+        pcall(function()
+            for _, folder in ipairs({"", "workspace"}) do
+                local files = listfiles(folder) or {}
+                for _, f in ipairs(files) do
+                    local clean = f:lower():gsub(string.char(92), "/")
+                    if clean:find("rivals_config") then
+                        table.insert(candidatePaths, f)
+                    end
+                end
+            end
+        end)
+    end
+
+    local targetFile = nil
+    for _, path in ipairs(candidatePaths) do
+        local ok, exists = pcall(isfile, path)
+        if ok and exists then
+            targetFile = path
+            break
+        end
+    end
+
+    if not targetFile then
+        return 0, "rivals_config.lua was not found in your executor's workspace folder! Make sure rivals_config.lua is placed in your workspace directory."
+    end
+
+    print("[RivalsSkinChanger] Config: " .. tostring(targetFile)
+        .. (_G.__RIVALS_SUPPORT_ID and ("  (ref " .. _G.__RIVALS_SUPPORT_ID .. ")") or ""))
+    local okRead, r2 = pcall(readfile, targetFile)
+    if not okRead or not r2 then
+        return 0, "Failed to read file '" .. tostring(targetFile) .. "'. File may be locked by another application."
+    end
+
+    if r2:sub(1, 3) == string.char(239, 187, 191) then
+        r2 = r2:sub(4)
+    end
+
+    if #r2:gsub("%s+", "") == 0 then
+        return 0, "Config file '" .. tostring(targetFile) .. "' is completely empty (0 bytes). Please generate your config on the website."
+    end
+
+    if not wf then
+        return 0, "Game assets folder (ViewModels.Weapons) is not loaded yet. Are you in a match or shooting range?"
+    end
+
+    local parsedPairs = 0
+    local nonDefaultPairs = 0
+    local missingBaseWeapons = {}
+    local missingSkinModels = {}
+    local swappedCount = 0
+    local skippedNoScript = {}
+    local vmMods = LP.PlayerScripts:FindFirstChild("Modules")
+    vmMods = vmMods and vmMods:FindFirstChild("ViewModels")
+    _G.__RSC_VMS_LIVE = vmMods
+
+    -- Family scripts by their real names, before any line trades them.
+    local vmOrder = vmMods and vmMods:GetChildren() or {}
+    local vmFamilies = {}
+    for _, c in ipairs(vmOrder) do vmFamilies[c.Name] = c end
+
+    -- The game picks a viewmodel script with ViewModels:FindFirstChild(name, true).
+    -- On Energy Rifle, Sniper, Freeze Ray and the like the family script is both
+    -- the default weapon's script and the base class every skin script requires
+    -- by name (ViewModels["Energy Rifle"]), so the two can't simply trade names.
+    -- Instead the skin script, named like the weapon, moves into an earlier family,
+    -- which a depth-first search reaches before the family script; the family
+    -- script keeps its name for the require. It trades places with a spare script
+    -- there that no config line uses, which keeps its own name.
+    local spares = {}
+    -- Roblox's FindFirstChild(name, true) looks at direct children before
+    -- going deeper, so a skin script moved ahead is only found once the
+    -- family script stops answering to the weapon's name. It takes the
+    -- harmless name "Modules", and the live ViewModels folder then trades
+    -- places with the clean copy in StarterPlayerScripts: the game keeps its
+    -- own reference to the live folder for the lookup, while skin scripts
+    -- reach their base by path (ViewModels["Sniper"]) in the clean copy.
+    local familiesRenamed = false
+    local cleanVmParent = game:GetService("StarterPlayer"):FindFirstChild("StarterPlayerScripts")
+    cleanVmParent = cleanVmParent and cleanVmParent:FindFirstChild("Modules")
+    local function moveAhead(sm, fam, inConfig)
+        for _, host in ipairs(vmOrder) do
+            if host == fam then return false end
+            if not spares[host] then
+                spares[host] = {}
+                local default = host.Name:gsub("^Base", "")
+                for _, c in ipairs(host:GetChildren()) do
+                    if c.ClassName == "ModuleScript" and c.Name ~= default and not inConfig[c.Name] then
+                        table.insert(spares[host], c)
+                    end
+                end
+            end
+            local spare = table.remove(spares[host], 1)
+            if spare then
+                -- Names first, so the swap leaves each with the right one; the
+                -- next run then undoes the swap before the names.
+                return (copyName(sm, spare) and copyName(spare, fam) and swapTwoWay(sm, spare, host)) and true or false
+            end
+        end
+        return false
+    end
+
+    local jobs, swapJobs, touched, skippedConflicts = {}, {}, {}, {}
+
+    local section = "skins"
+    for _, rawLine in ipairs(r2:split(string.char(10))) do
+        local header = rawLine:gsub(string.char(13), ""):match("^%s*%[%s*(.-)%s*%]%s*$")
+        if header then
+            local h = header:lower()
+
+            section = h:find("health") and "healthbar" or h:find("button") and "buttons" or h:find("wrap") and "wraps" or (h:find("sky") and "skybox"
+                or (h:find("light") and "lighting" or (h:find("finisher") and "finishers"
+                or (h:find("charm") and "charms" or (h:find("sound") and "sounds"
+                or (h:find("spoof") and "spoof" or (h:find("tracer") and "tracers" or (h:find("hand") and "nohands"
+                or (h:find("skin") and "skins" or "other")))))))))
+        elseif section == "other" then
+
+        elseif section == "finishers" or section == "charms" then
+            local owned, target = parseConfigLine(rawLine)
+            if owned and target and owned ~= target then
+                local list = section == "finishers" and configFinishers or configCharms
+                list[#list + 1] = {owned, target}
+            end
+        elseif section == "wraps" then
+            local owned, target = parseConfigLine(rawLine)
+            if owned and target then configWrapPairs[#configWrapPairs + 1] = {owned, target} end
+        elseif section == "skybox" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configSkybox[key:lower()] = value end
+        elseif section == "sounds" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configSounds[key:lower()] = value end
+        elseif section == "spoof" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configSpoof[key:lower()] = value end
+        elseif section == "nohands" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configNoHands[key:lower()] = value end
+        elseif section == "tracers" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configTracers[key:lower()] = value end
+        elseif section == "lighting" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then configLighting[key:lower()] = value end
+        elseif section == "healthbar" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then _G.__RSC_HPBAR_CFG[key:lower()] = value end
+        elseif section == "buttons" then
+            local key, value = parseConfigLine(rawLine)
+            if key and value then _G.__RSC_BTN_CFG[key:lower()] = value end
+        else
+            local weaponName, skinTarget = parseConfigLine(rawLine)
+            if weaponName and skinTarget then
+                jobs[#jobs + 1] = {weaponName, skinTarget, weaponName}
+            else
+                local w, owned, target = parseSkinSwapLine(rawLine)
+                if w then swapJobs[#swapJobs + 1] = {w, target, owned} end
+            end
+        end
+    end
+    for _, j in ipairs(swapJobs) do jobs[#jobs + 1] = j end
+    local inConfig = {}
+    for _, j in ipairs(jobs) do inConfig[j[1]], inConfig[j[2]], inConfig[j[3]] = true, true, true end
+
+    for _, job in ipairs(jobs) do
+        local weaponName, skinTarget, srcName = job[1], job[2], job[3]
+        local ownedSwap = srcName ~= weaponName
+        parsedPairs = parsedPairs + 1
+        local skinLower = skinTarget:lower()
+        local isSkin = skinLower ~= "default" and skinLower ~= "standard"
+        -- Set once the skin's own viewmodel script is in place. That script
+        -- finds its effects by their real names, so they must not be renamed.
+        local scriptMoved = false
+
+        if isSkin and (touched[skinTarget] or touched[srcName]) then
+            table.insert(skippedConflicts, srcName .. " -> " .. skinTarget
+                .. " (" .. (touched[skinTarget] or touched[srcName]) .. " already uses it)")
+        else
+            if isSkin then
+                local line = srcName .. " -> " .. skinTarget
+                touched[skinTarget], touched[srcName] = line, line
+                nonDefaultPairs = nonDefaultPairs + 1
+                if not ownedSwap then ACTIVE_CONFIG_SKINS[weaponName] = skinTarget end
+                if SCOPE_RETICLES[weaponName] then
+                    scopeSkins[weaponName] = {skinTarget, ownedSwap and srcName or nil}
+                end
+                local function findSource()
+                    if ownedSwap then return findSkinModel(srcName) end
+                    return wf:FindFirstChild(weaponName)
+                end
+
+                local defModel = findSource()
+                if not defModel then
+                    for _ = 1, 6 do
+                        task.wait(0.5)
+                        defModel = findSource()
+                        if defModel then break end
+                    end
+                end
+                if not defModel then
+                    table.insert(missingBaseWeapons, srcName)
+                else
+
+                    local skinModel = findSkinModel(skinTarget)
+                    if not skinModel then
+                        for _ = 1, 6 do
+                            task.wait(0.5)
+                            skinModel = findSkinModel(skinTarget)
+                            if skinModel then break end
+                        end
+                    end
+                    if not skinModel then
+                        table.insert(missingSkinModels, skinTarget)
+                    else
+                        if defModel.Address and skinModel.Address and defModel.Address ~= skinModel.Address then
+                            if ENABLE_RIG_FIXES then rigSkinModel(skinModel) end
+
+                            local weaponLower = weaponName:lower()
+                            if weaponLower:find("crossbow") or skinLower:find("crossbow") then
+                                if ENABLE_RIG_FIXES then pcall(fixCrossbowRig, skinModel) end
+                            elseif weaponLower:find("bow") or skinLower:find("bow") then
+                                if ENABLE_RIG_FIXES then pcall(fixBowRig, skinModel) end
+                            elseif weaponLower:find("rpg") or skinLower:find("rpkey") or skinLower:find("rocket") then
+                                if ENABLE_RIG_FIXES then pcall(fixRPGRig, skinModel) end
+                            elseif weaponLower == "grenade" or skinLower:find("nade") or skinLower:find("bomb") then
+                                if ENABLE_RIG_FIXES then pcall(fixGrenadeRig, skinModel) end
+                            elseif weaponLower == "gunblade" or skinLower:find("gunblade") or skinLower:find("blade") then
+                                if ENABLE_RIG_FIXES then pcall(fixGunbladeRig, skinModel) end
+                            elseif weaponLower == "katana" or skinLower:find("katana") then
+                                if ENABLE_RIG_FIXES then pcall(fixKatanaRig, skinModel) end
+                            end
+
+                            local baseMod = vmMods and vmMods:FindFirstChild("Base" .. (weaponName:gsub(" ", "")))
+                            local defMod = baseMod and baseMod:FindFirstChild(srcName)
+                            local skinMod = baseMod and baseMod:FindFirstChild(skinTarget)
+                            if defMod and not skinMod and not ownedSwap then
+                                table.insert(skippedNoScript, weaponName .. "=" .. skinTarget)
+                            elseif swapTwoWay(defModel, skinModel, wf) then
+                                swappedCount = swappedCount + 1
+                                table.insert(skinDataPairs, {srcName, skinTarget})
+                                if defMod and skinMod then
+                                    scriptMoved = swapTwoWay(defMod, skinMod, baseMod) and true or false
+                                elseif ownedSwap then
+
+                                    local fam = baseMod or vmFamilies[weaponName]
+                                    local om = fam and fam:FindFirstChild(srcName)
+                                    local sm = fam and fam:FindFirstChild(skinTarget)
+                                    if om and sm then
+                                        scriptMoved = swapTwoWay(om, sm, fam) and true or false
+                                    elseif sm and copyName(sm, skinModel) then
+                                        scriptMoved = true
+                                        table.insert(renamedScripts, {srcName, skinTarget})
+                                    elseif om then
+                                        copyName(om, defModel)
+                                    end
+                                elseif not baseMod then
+
+                                    local fam = vmFamilies[weaponName]
+                                    local sm = fam and fam:FindFirstChild(skinTarget)
+                                    if sm and fam.ClassName == "ModuleScript" then
+                                        if moveAhead(sm, fam, inConfig) then
+                                            scriptMoved = true
+                                            table.insert(renamedScripts, {weaponName, skinTarget})
+                                            if cleanVmParent and copyName(fam, cleanVmParent) then familiesRenamed = true end
+                                        end
+                                    elseif sm and not fam:FindFirstChild(weaponName) and copyName(sm, fam) then
+                                        scriptMoved = true
+                                        table.insert(renamedScripts, {weaponName, skinTarget})
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                -- Thrown, fired and stuck-in-the-wall copies of the item (a
+                -- grenade in flight, an arrow, the thrown spear and its rope).
+                -- The game picks them by skin name, for every weapon.
+                for _, folder in ipairs({tf or false, pf or false, stf or false}) do
+                    local ts = folder and folder:FindFirstChild(skinTarget)
+                    if ts then
+                        local tb = folder:FindFirstChild(srcName)
+                        if tb then
+                            swapTwoWay(tb, ts, folder)
+                        else
+                            copyName(ts, ownedSwap and findSkinModel(srcName) or wf:FindFirstChild(weaponName))
+                        end
+                    end
+                end
+
+                if mi then
+                    local spec = MISC_SPECIAL_MAP[skinTarget]
+                    if spec then
+                        for folderName, itemName in pairs(spec) do
+                            local folder = mi:FindFirstChild(folderName)
+                            if folder then
+
+                                local weaponItem = folder:FindFirstChild(srcName)
+                                local skinItem = folder:FindFirstChild(itemName)
+                                if skinItem and weaponItem then
+                                    swapTwoWay(weaponItem, skinItem, folder)
+                                elseif skinItem then
+                                    copyName(skinItem, ownedSwap and findSkinModel(srcName) or wf:FindFirstChild(weaponName))
+                                end
+                            end
+                        end
+                    end
+
+                    -- Every other effect folder keyed by skin name (muzzle flashes,
+                    -- flames, deflects...): the owned item takes the target's entry.
+                    -- A variant of the owned entry ("Hyperlaser Guns Red") would
+                    -- still win for its hand, so it is renamed out of the way.
+                    for _, folder in ipairs(mi:GetChildren()) do
+                        if folder.ClassName == "Folder" and not (spec and spec[folder.Name]) then
+                            local skinItem = folder:FindFirstChild(skinTarget)
+                            if skinItem then
+                                local weaponItem = folder:FindFirstChild(srcName)
+                                if weaponItem then
+                                    swapTwoWay(weaponItem, skinItem, folder)
+                                else
+                                    copyName(skinItem, ownedSwap and findSkinModel(srcName) or wf:FindFirstChild(weaponName))
+                                end
+                                local prefix = srcName .. " "
+                                for _, v in ipairs(folder:GetChildren()) do
+                                    if v.Name:sub(1, #prefix) == prefix and not findSkinModel(v.Name)
+                                        and not folder:FindFirstChild(skinTarget .. v.Name:sub(#prefix)) then
+                                        copyName(v, folder)
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    local expSkin = MISC_EXPLOSIONS_MAP[skinTarget]
+
+                    local expBase = MISC_EXPLOSIONS_MAP[srcName]
+                    if not ownedSwap then expBase = MISC_EXPLOSIONS_BASE[weaponName] end
+                    if expSkin and expBase and not scriptMoved then
+                        local sx = mi:FindFirstChild(expSkin)
+                        local dx = mi:FindFirstChild(expBase)
+                        if sx and dx then
+                            swapTwoWay(dx, sx, mi)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if familiesRenamed then
+        local cleanVm = cleanVmParent and cleanVmParent:FindFirstChild("ViewModels")
+        if not (cleanVm and vmMods and swapTwoWay(vmMods, cleanVm, nil)) then
+            print("[RivalsSkinChanger] Couldn't set up the switch-mode scripts for " .. "Sniper / Energy Rifle / Freeze Ray skins - they keep the default effects")
+        end
+    end
+
+    pcall(applySoundCallbacks)
+
+    if swappedCount == 0 then
+        if parsedPairs == 0 then
+            return 0, "Found '" .. tostring(targetFile) .. "', but no valid Weapon=Skin lines were detected! Check file format."
+        elseif nonDefaultPairs == 0 then
+            return 0, "All " .. parsedPairs .. " weapons in '" .. tostring(targetFile) .. "' are set to Default. Please select at least one custom skin on the site."
+        elseif #missingBaseWeapons > 0 and #missingSkinModels == 0 then
+            return 0, "Base weapons (" .. table.concat(missingBaseWeapons, ", ") .. ") not found in game folder."
+        elseif #missingSkinModels > 0 then
+            return 0, "Skin models not found in game assets: " .. table.concat(missingSkinModels, ", ")
+        else
+            return 0, "Memory swap failed. Ensure memory read/write permissions are allowed in executor."
+        end
+    end
+
+    if #missingBaseWeapons > 0 then
+        print("[RivalsSkinChanger] Not swapped - model not found for: " .. table.concat(missingBaseWeapons, ", "))
+    end
+    if #missingSkinModels > 0 then
+        print("[RivalsSkinChanger] Not swapped - skin model not found: " .. table.concat(missingSkinModels, ", "))
+    end
+    if #skippedConflicts > 0 then
+        print("[RivalsSkinChanger] Skipped (skin already used by another line): " .. table.concat(skippedConflicts, ", "))
+        -- A swap trades two models, so a skin can only be in one line.
+        notifyUser("Rivals Skin Changer", "Skipped " .. #skippedConflicts .. " skin line" .. (#skippedConflicts == 1 and "" or "s")
+            .. " - two lines use the same skin: " .. table.concat(skippedConflicts, ", "), 10)
+    end
+    if #skippedNoScript > 0 then
+        print("[RivalsSkinChanger] Left default (skin has no viewmodel script of its own): " .. table.concat(skippedNoScript, ", "))
+    end
+    if #renamedScripts > 0 then
+        local names = {}
+        for _, rn in ipairs(renamedScripts) do names[#names + 1] = rn[2] end
+        print("[RivalsSkinChanger] Using the skin's own viewmodel script: " .. table.concat(names, ", "))
+    end
+    return swappedCount, nil
+end
+
+-- Wait for the game
+local gameReady = false
+do
+    local mods = game:GetService("ReplicatedStorage"):WaitForChild("Modules", 30)
+    local il = mods and mods:WaitForChild("ItemLibrary", 30)
+    local cl = mods and mods:WaitForChild("CosmeticLibrary", 30)
+    local job, t0, told = game.JobId, tick(), false
+    while tick() - t0 < 60 do
+        local okI, itemTable = pcall(moduleTable, il)
+        if okI and itemTable then
+
+            for _ = 1, 10 do
+                local okC, cosTable = pcall(moduleTable, cl)
+                if okC and cosTable then break end
+                task.wait(0.5)
+            end
+            gameReady = true
+            break
+        end
+        if not told and tick() - t0 > 2 then
+            told = true
+            print("[RivalsSkinChanger] Waiting for the game to finish loading...")
+        end
+        -- The tables load within seconds; if the route itself still can't be
+        -- worked out after 8, waiting longer won't help.
+        if not ROUTE.ok and tick() - t0 > 8 then
+            local tr = _G.__RSC_ROUTE_TRACE or {}
+            print("[RivalsSkinChanger] Couldn't read this Roblox build's memory layout (" .. tostring(tr.stop)
+                .. ") - going ahead with the slower lookup")
+            break
+        end
+        task.wait(0.5)
+        if game.JobId ~= job then
+            print("[RivalsSkinChanger] Server changed while waiting - stopped")
+            _G.__RIVALS_SKIN_CHANGER_BUSY = nil
+            return
+        end
+    end
+    if not gameReady then
+        print("[RivalsSkinChanger] The game still isn't reporting its item tables after 60s - going ahead anyway")
+    end
+end
+
+local count, errorReason = applySkinSwapper()
+saveUndo() -- saved now, in case a later step fails before the final save
+local elapsed = math.floor((tick() - t_start) * 1000)
+
+if count == 0 then
+    local errText = errorReason or "Unknown error while loading skins."
+    warn("[RivalsSkinChanger] ==================================================")
+    warn("[RivalsSkinChanger] ERROR: 0 SKINS LOADED!")
+    warn("[RivalsSkinChanger] Details: " .. errText)
+    warn("[RivalsSkinChanger] ==================================================")
+    notifyUser("Rivals Skin Changer Error", "0 Skins Loaded: " .. errText, 10)
+else
+    local msg = "Swapped " .. tostring(count) .. " skins in " .. tostring(elapsed) .. "ms!"
+        .. (_G.__RIVALS_SUPPORT_ID and ("  ref " .. _G.__RIVALS_SUPPORT_ID) or "")
+    print("[RivalsSkinChanger] " .. msg)
+    notifyUser("Rivals Skin Changer", "Swapped " .. tostring(count) .. " skins - loading animations, offsets and icons...", 6)
+end
+
+local function replaceStandardIcon(label)
+    if not label or not label.Address then return end
+    local ptr = mrd("uintptr_t", label.Address + IMG_OFF)
+    if not ptr or ptr < 0x10000000000 or ptr > 0x7FFFFFFFFFFF then return end
+    local cur = mrd("string", ptr)
+    if not cur then return end
+    local weaponName = STANDARD_ICON_MAP[cur]
+    if weaponName and ACTIVE_CONFIG_SKINS[weaponName] then
+        local skinTarget = ACTIVE_CONFIG_SKINS[weaponName]
+        local skinIcon = ITEM_ICONS[weaponName] and (ITEM_ICONS[weaponName][skinTarget] or ITEM_ICONS[weaponName][skinTarget:lower()])
+        if skinIcon and skinIcon ~= cur then
+            writeImage(label, skinIcon)
+        end
+    end
+end
+
+local runService = game:GetService("RunService")
+local renderSteppedConn = nil
+local pgDescConn = nil
+
+local function fastSyncGui()
+    if not _scriptAlive or not game:IsLoaded() or not LP or not LP.Parent or not LP:IsDescendantOf(game) then return end
+    pcall(alignWeaponWings)
+    local pg = LP:FindFirstChild("PlayerGui")
+    local mg = pg and pg:FindFirstChild("MainGui")
+    local mf = mg and mg:FindFirstChild("MainFrame")
+    if not mf then return end
+
+    local fi = mf:FindFirstChild("FighterInterfaces")
+    local lni = fi and fi:FindFirstChild(LP.Name)
+    if lni then
+        local sub = lni:FindFirstChild("BottomRight") or lni:FindFirstChild("BottomCenter") or lni:FindFirstChild("BottomLeft")
+        local c = sub and sub:FindFirstChild("Container")
+        local hb = c and c:FindFirstChild("Hotbar")
+        local cont = hb and hb:FindFirstChild("Container")
+        if cont then
+            for _, slot in ipairs(cont:GetChildren()) do
+                if slot.ClassName == "Frame" then
+                    if slot.Name == "EquippedDisplay" then
+                        local c2 = slot:FindFirstChild("Container")
+                        local w2 = c2 and c2:FindFirstChild("Weapon")
+                        local iconLabel = w2 and w2:FindFirstChild("Icon")
+                        if iconLabel and iconLabel.ClassName == "ImageLabel" and lastEquippedWeapon then
+                            local skinTarget = ACTIVE_CONFIG_SKINS[lastEquippedWeapon]
+                            if skinTarget then
+                                local skinIcon = ITEM_ICONS[lastEquippedWeapon] and (ITEM_ICONS[lastEquippedWeapon][skinTarget] or ITEM_ICONS[lastEquippedWeapon][skinTarget:lower()])
+                                if skinIcon then
+                                    writeImage(iconLabel, skinIcon)
+                                end
+                            end
+                        end
+                    elseif slot.Name ~= "KeybindGamepadEquipLast" and slot.Name ~= "KeybindGamepadEquipNext" and slot.Name ~= "Layout" then
+                        local weaponName = slot.Name
+                        local skinTarget = ACTIVE_CONFIG_SKINS[weaponName]
+                        if skinTarget then
+                            local skinIcon = ITEM_ICONS[weaponName] and (ITEM_ICONS[weaponName][skinTarget] or ITEM_ICONS[weaponName][skinTarget:lower()])
+                            if skinIcon then
+                                local iconLabel = slot:FindFirstChild("Icon")
+                                if iconLabel and iconLabel.ClassName == "ImageLabel" then
+                                    writeImage(iconLabel, skinIcon)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local eq = mf:FindFirstChild("Equipment")
+    if eq and eq.Visible then
+        for _, d in ipairs(eq:GetDescendants()) do
+            if d.ClassName == "ImageLabel" or d.ClassName == "ImageButton" then
+                replaceStandardIcon(d)
+            end
+        end
+    end
+
+    local pages = mf:FindFirstChild("Pages")
+    if pages then
+        local pw = pages:FindFirstChild("PickWeapons")
+        if pw and pw.Visible then
+            local list = pw:FindFirstChild("List") and pw.List:FindFirstChild("Container")
+            if list then
+                for _, f in ipairs(list:GetChildren()) do
+                    local btn = f:FindFirstChild("Button")
+                    local pic = btn and btn:FindFirstChild("Icon") and btn.Icon:FindFirstChild("Picture")
+                    if pic and pic.ClassName == "ImageLabel" then
+                        replaceStandardIcon(pic)
+                    end
+                end
+            end
+            local chosen = pw:FindFirstChild("ChosenWeapons")
+            if chosen then
+                for _, f in ipairs(chosen:GetChildren()) do
+                    local btn = f:FindFirstChild("Button")
+                    local pic = btn and btn:FindFirstChild("Picture")
+                    if pic and pic.ClassName == "ImageLabel" then
+                        replaceStandardIcon(pic)
+                    end
+                end
+            end
+        end
+
+        local pw2 = pages:FindFirstChild("PickWeaponsList")
+        if pw2 and pw2.Visible then
+            local lc = pw2:FindFirstChild("ListContainer") and pw2.ListContainer:FindFirstChild("List") and pw2.ListContainer.List:FindFirstChild("Container")
+            if lc then
+                for _, s in ipairs(lc:GetChildren()) do
+                    local btn = s:FindFirstChild("Button")
+                    local pic = btn and btn:FindFirstChild("Icon") and btn.Icon:FindFirstChild("Picture")
+                    if pic and pic.ClassName == "ImageLabel" then
+                        replaceStandardIcon(pic)
+                    end
+                end
+            end
+            local ch = pw2:FindFirstChild("ChosenWeapons")
+            if ch then
+                for _, s in ipairs(ch:GetChildren()) do
+                    local btn = s:FindFirstChild("Button")
+                    local pic = btn and btn:FindFirstChild("Picture")
+                    if pic and pic.ClassName == "ImageLabel" then
+                        replaceStandardIcon(pic)
+                    end
+                end
+            end
+        end
+    end
+
+    for weaponName, pick in pairs(scopeSkins) do
+        -- The target's scope, or the plain one when only the owned skin has its own.
+        local scopeConf = SCOPE_RETICLES[pick[1]]
+            or (pick[2] and SCOPE_RETICLES[pick[2]] and SCOPE_RETICLES[weaponName])
+        if scopeConf then
+            local ii = mf:FindFirstChild("ItemInterfaces")
+            local si = ii and ii:FindFirstChild(LP.Name .. " - " .. weaponName)
+            local sc2 = si and si:FindFirstChild("Mouse") and si.Mouse:FindFirstChild("Scope")
+            if sc2 then
+                local bi = sc2:FindFirstChild("Blur") and sc2.Blur:FindFirstChild("ImageLabel")
+                local ci = sc2:FindFirstChild("Circle") and sc2.Circle:FindFirstChild("ImageLabel")
+                if bi and scopeConf.blur then writeImage(bi, scopeConf.blur) end
+                if ci and scopeConf.circle then writeImage(ci, scopeConf.circle) end
+            end
+        end
+    end
+end
+
+pcall(function()
+    if not ENABLE_PERSISTENT_FEATURES then return end
+    renderSteppedConn = runService.RenderStepped:Connect(fastSyncGui)
+end)
+
+pcall(function()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then
+        if not ENABLE_PERSISTENT_FEATURES then return end
+        pgDescConn = pg.DescendantAdded:Connect(function(d)
+            if d.ClassName == "ImageLabel" or d.ClassName == "ImageButton" then
+                replaceStandardIcon(d)
+                if d.Name == "Icon" and d.Parent and d.Parent.ClassName == "Frame" then
+                    local wName = d.Parent.Name
+                    local skinTarget = ACTIVE_CONFIG_SKINS[wName]
+                    if skinTarget then
+                        local skinIcon = ITEM_ICONS[wName] and (ITEM_ICONS[wName][skinTarget] or ITEM_ICONS[wName][skinTarget:lower()])
+                        if skinIcon then
+                            writeImage(d, skinIcon)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- Wraps
+local function readWrapPairs()
+    local list, seen = {}, {}
+
+    for _, p in ipairs(configWrapPairs) do
+        if not seen[p[1]] then
+            seen[p[1]] = true
+            list[#list + 1] = p
+        end
+    end
+    for _, p in ipairs({"rivals_wraps.lua", "rivals_wraps.txt", "workspace/rivals_wraps.lua", "workspace/rivals_wraps.txt"}) do
+        local okE, exists = pcall(isfile, p)
+        if okE and exists then
+            local okR, content = pcall(readfile, p)
+            if okR and content then
+                for line in content:gmatch("[^\r\n]+") do
+
+                    local owned, target = line:match("^%s*([^=%-][^=]-)%s*=%s*(.-)%s*$")
+                    if owned and target and target ~= "" and not seen[owned] then
+                        seen[owned] = true
+                        list[#list + 1] = {owned, target}
+                    end
+                end
+                break
+            end
+        end
+    end
+    return list
+end
+
+-- Skybox
+local SKYBOX_PRESETS = {
+    ["blue"] = {"14147881792", "14147882149", "14147882761", "14147883091", "14147882405", "14147881297"},
+    ["station"] = {"2108482005", "2108545280", "2108482231", "2108482395", "2108482542", "2108482676"},
+    ["graveyard"] = {"135908632589654", "103020541883227", "135908632589654", "135908632589654", "135908632589654", "72960281658487"},
+    ["sudden death"] = {"84214501374682", "89972436184102", "84214501374682", "84214501374682", "84214501374682", "92138082970751"},
+    ["space"] = {"10196550937", "10196550667", "10196550367", "10196550128", "10196549902", "10196567794"},
+    ["westown"] = {"12261809766", "12261813110", "12261809766", "12261809766", "12261809766", "12261813678"},
+    ["black"] = {"91612392386438", "91612392386438", "91612392386438", "91612392386438", "91612392386438", "91612392386438"},
+    -- Uploaded skybox packs (tools/skies in the site repo), bk, dn, ft, lf, rt, up.
+    ["cloudy 01"] = {"126754633897436", "86836627001306", "95905829433933", "122177936450348", "73237790687889", "90043570165995"},
+    ["cloudy 02"] = {"94510925134380", "83533436371824", "98229751924468", "106855992262577", "71111483218129", "119866829919660"},
+    ["cloudy 03"] = {"134908890676304", "98162794332047", "125777961418491", "109989177196148", "137809355685720", "114251179295721"},
+    ["cloudy 04"] = {"107504801883128", "100991020543969", "73636039679787", "110786702878669", "82663836073959", "112042298121106"},
+    ["cloudy 05"] = {"79487977466864", "90350734201812", "101510283118396", "102883759888031", "120175709830675", "136284198010930"},
+    ["cloudy 06"] = {"133455855232355", "75675276221409", "102683810113255", "134026356692589", "111492255033052", "101979509281748"},
+    ["cloudy 07"] = {"124630411829214", "137650278511829", "94482967698658", "103953753436574", "112959082352845", "137140884144826"},
+    ["cloudy 08"] = {"90205622288987", "110151968622887", "104626178246233", "91598099503456", "81058694870129", "93729434721830"},
+    ["cloudy 09"] = {"139434321199889", "98219516871257", "105913104685597", "125324169983163", "116997570198371", "103330194362875"},
+    ["cloudy 10"] = {"81449501205294", "124487320003897", "80904431050447", "86646953803917", "75263551301936", "97788349971545"},
+    ["cloudy 11"] = {"120871881275722", "127341735225402", "116601891103440", "94491027998722", "88353388175296", "91160816562958"},
+    ["cloudy 12"] = {"113535280016994", "127900371948747", "120725193588788", "111770429925795", "129196586387140", "79378495098669"},
+    ["cloudy 13"] = {"108831654470087", "79181118455270", "112187446252336", "104704362496407", "140447704903267", "71772855934062"},
+    ["cloudy 14"] = {"105093562532797", "85003418570488", "131779651921685", "70609184831645", "86282293662867", "134608849387985"},
+    ["cloudy 15"] = {"131536188889612", "118093331916732", "107336475861306", "110056465107774", "105163681975273", "92081035276480"},
+    ["cloudy 16"] = {"109782717368475", "76246782640274", "121489338023768", "105948832901369", "115101533846700", "114420609506473"},
+    ["cloudy 17"] = {"88662414547866", "110554210020228", "88313273447587", "134665095359798", "90541216303413", "121014099637227"},
+    ["cloudy 18"] = {"106360292691579", "103249577541997", "110484795494314", "129304457043156", "114083127638311", "78124003378079"},
+    ["cloudy 19"] = {"115116233569094", "133685857606690", "95607439806027", "93689502105544", "128807133605420", "111228278131898"},
+    ["cloudy 20"] = {"124208488902038", "91200268945217", "111384709364077", "140170044783927", "118024637233382", "111697448595697"},
+    ["cloudy 21"] = {"104201550309251", "117677338325723", "78563702293497", "120997393510904", "103388622930665", "89839615332589"},
+    ["cloudy 22"] = {"74892504537101", "88612926659487", "79034090244073", "71664566729417", "134540865217875", "127631258082669"},
+    ["cloudy 23"] = {"119599708543402", "83824957038386", "122253064867736", "82619654415458", "100939349583458", "74891504302768"},
+    ["cloudy 24"] = {"121378533477721", "117082750895246", "115547003946313", "121390352061507", "79982218533687", "72692515998179"},
+    ["cloudy 25"] = {"83309474203162", "124498349051494", "134496968945569", "107851671443849", "85866561501104", "78405144176503"},
+    ["aurora"] = {"82352303427137", "96955417930238", "70693009382116", "92323947198095", "101484321631706", "127098348323271"},
+    ["beautiful"] = {"116672032304016", "95474895156007", "117254687878540", "123939119810944", "79800107437752", "111449085724360"},
+    ["black hole"] = {"116504252512407", "121192434046906", "93140195195460", "126158825072453", "108152937067748", "120737673672733"},
+    ["blue sky"] = {"111226335375496", "70698080470589", "135460470760231", "108364190494169", "102401408407259", "84913859761300"},
+    ["broken sky"] = {"140318382500274", "70376747543189", "122572758833753", "81796529025721", "130970680489698", "127489560502180"},
+    ["castle grounds"] = {"132684157632736", "75871520273888", "123610654088356", "81901114515968", "125953193051791", "127486891652478"},
+    ["chill gray"] = {"77842177495110", "114334349985521", "73085498719543", "86536487540867", "84114373463358", "82808825050309"},
+    ["chill pink"] = {"118254399894024", "85716664023514", "85009657482785", "131849586353390", "104031429125910", "134439405617170"},
+    ["chroma key"] = {"90442722159154", "101767999901114", "135103395168302", "81361144661403", "120260457258062", "106801842629627"},
+    ["clear skies"] = {"131604034085442", "124442772007488", "112131474227507", "122804241917136", "124902787794157", "78411342576386"},
+    ["cyan"] = {"128656160498159", "118751508340898", "105253548774950", "128681770617915", "90450225168968", "80720430106936"},
+    ["dead star forest"] = {"132669969757222", "83257816122732", "107514798824659", "79329572889354", "120138393789020", "99834020318151"},
+    ["elegant morning"] = {"136596483616545", "71044316590502", "104097006599780", "125119298107295", "78607773761530", "114308879347225"},
+    ["emo"] = {"102057353520404", "116942968724467", "130364322644635", "129139815007127", "103930352896233", "88432806535250"},
+    ["fade blue"] = {"70733763806586", "109278040786728", "82544751736691", "94758701607223", "84907768047806", "92504584784302"},
+    ["forest"] = {"130105943383590", "87400440640257", "128128579477883", "71462749755980", "88253495750932", "134930785824238"},
+    ["galaxy"] = {"84129238345796", "103265672483730", "111177857256367", "136671627884048", "112973201740035", "79105441573587"},
+    ["goodnight"] = {"74147707477322", "104523964090186", "122795694381170", "132165510807421", "97017409517063", "104070547512626"},
+    ["grimnight"] = {"102210941854270", "100071765140291", "89968755628817", "74976196740154", "98509116093327", "139554813054186"},
+    ["hades"] = {"80609197077607", "134171614722360", "138791372904720", "81411466729497", "126710749167136", "73236105065482"},
+    ["hazy"] = {"83761265032166", "95296355231411", "127921746808314", "87116530681623", "124355925636828", "116541187345656"},
+    ["jungle"] = {"80590623005999", "131910954278674", "107456602072991", "84324211182348", "129168150784414", "81963990472289"},
+    ["light blue"] = {"118414702738976", "122597975638493", "124870258148165", "112730907758242", "126654131576636", "117444670288097"},
+    ["light pink"] = {"139223053439707", "103995147942567", "99465211065402", "102235997947203", "110149967143852", "100057183813215"},
+    ["minecraft end"] = {"116945895581974", "78722265045527", "134800311806353", "88177582544328", "75599829998976", "104125293164860"},
+    ["minecraft"] = {"114454130916729", "109548025240626", "130020938273317", "110272487224075", "136239019000790", "81171956837775"},
+    ["moonlight"] = {"98895094117807", "98962847961441", "134374834765126", "128874794490495", "138146075324352", "128466147827573"},
+    ["blue nebula"] = {"86686245579171", "108113096612020", "81877733877143", "119128617757798", "128328409316361", "102542960042748"},
+    ["gold nebula"] = {"84095138366077", "77738459731844", "119092184893445", "137679633917616", "122487493876092", "103170638607510"},
+    ["neon sky"] = {"110536311519381", "74820745224715", "109305772584204", "104093162456511", "120628751321359", "70629794155932"},
+    ["neon sky 2"] = {"117695973144304", "96687214728525", "107244237325558", "79853143003679", "103164363708800", "80287143613038"},
+    ["night"] = {"111506849899115", "111624859236839", "85274575738080", "125290741835689", "113064117603145", "131125584492971"},
+    ["night sky moon"] = {"112908838333749", "88106974251525", "95077927902336", "103082598474272", "126296579988260", "136018257995007"},
+    ["northern lights"] = {"135667725269914", "105659975445493", "139686226882630", "103053836788988", "133783036950754", "131678127881562"},
+    ["oblivion"] = {"96685133253614", "86123661388551", "124862863981581", "116092220825677", "138516114089401", "82914065543123"},
+    ["orange"] = {"138978746667522", "95283566510780", "102907453647408", "109462964348020", "120987252565412", "133626741339263"},
+    ["overcast"] = {"99870262630210", "93059109878338", "72163615129668", "109874952315586", "127298432525460", "86261531752900"},
+    ["pandora"] = {"110311863780960", "124328705240454", "133885444367306", "83902983588286", "135627944664931", "80639059541487"},
+    ["peaceful morning"] = {"80744984797601", "139160805974232", "86848296784362", "84785420334318", "112196955715008", "90763575016985"},
+    ["pink sunrise"] = {"94014428698610", "113515710394443", "92061586341960", "97121838959073", "140530693929389", "94028327724496"},
+    ["pumpkin hill"] = {"129716677007306", "124105363416376", "105971182728755", "89198494997022", "138716194235633", "84890062729003"},
+    ["purple nebula"] = {"75026396953993", "99796459631730", "115194314582283", "116461720353785", "75882647617429", "86759680720821"},
+    ["red"] = {"81671840129096", "95334302882082", "118809384240080", "81331903433727", "86424558511460", "124960075039840"},
+    ["setting sun"] = {"111401606618381", "123413205062436", "123294723748917", "111859405551319", "136486797861154", "105783476050536"},
+    ["sfoth"] = {"134938753015290", "115871984730647", "129890749688631", "139637924732127", "131258245002931", "120078593797661"},
+    ["shiverfrost"] = {"109671844082146", "76699561795262", "74660081943856", "88233310916948", "121911031322655", "84001786617208"},
+    ["sky 05"] = {"115023392465265", "75603771116960", "78650451282536", "139249932495923", "109204323592662", "78606335131166"},
+    ["sky 13"] = {"82376944970913", "93258366205385", "117596344693687", "109213974819587", "93314873685454", "111780089442621"},
+    ["sky 22"] = {"136007365598982", "113090853463695", "102781864501443", "86334871447680", "129595274224805", "87293939325159"},
+    ["sky 31"] = {"112473313859415", "119563752872717", "84283685338061", "134249301389168", "84283059059446", "102509841088734"},
+    ["sky 38"] = {"85926227746329", "109924332182419", "134503258168834", "107319881513601", "115465032587932", "140683409884042"},
+    ["sky 47"] = {"92328573760216", "134440566308824", "91601437949085", "104367884785983", "77798112301231", "110687721781978"},
+    ["disaster"] = {"137160574941336", "102081467095261", "103689251646919", "102821281425724", "120985841295097", "136071964183254"},
+    ["nibiru"] = {"86777970883943", "78763305966371", "114611372007819", "128061927873372", "85771331520419", "97909107363558"},
+    ["sky purple"] = {"100569279835430", "92953290387081", "128755780823612", "133226682664457", "93855588590700", "127394092345028"},
+    ["sky sunset"] = {"140082532251676", "103439208027471", "139582216083282", "113085611483648", "117039129859641", "82063345800656"},
+    ["sky 2006"] = {"108049587733516", "90827876928083", "88528160176232", "132704699369288", "120394575432100", "120102414361858"},
+    ["space blue"] = {"119997319906862", "86627772038606", "107221202344783", "110202674373451", "136027305730732", "108280367323622"},
+    ["spooky"] = {"91607656582731", "99188944117258", "72879878113173", "127320958969849", "85021430483699", "124093998930865"},
+    ["sunny sky"] = {"110554184501744", "98230875632640", "102338421528132", "90545823496973", "85347898526250", "90004379021835"},
+    ["universe"] = {"109782613665358", "91334243969431", "85256564797442", "71131512684325", "108186194320722", "103590433878590"},
+    ["utter east"] = {"92625772015085", "133826037116886", "122990386269233", "134162842602682", "121655127580859", "132800848916708"},
+    ["whomp fortress"] = {"102494717825947", "101497319167422", "134923413288202", "79580117155905", "135186735517033", "109014827889452"},
+    ["winterness"] = {"93314155085684", "86544552740075", "82163169918498", "113463592358754", "89545353728911", "112700328026196"},
+    ["xen"] = {"138521026317896", "93370270064161", "77429040495782", "124709280024255", "117416468013692", "98120283931640"},
+    ["zen end"] = {"109470247657976", "118949631704099", "122702664050796", "139189653780112", "125062544262187", "85640581945708"},
+}
+local SKYBOX_FACES = {{"bk", dumpOff("Sky", "SkyboxBk", 0xe8)}, {"dn", dumpOff("Sky", "SkyboxDn", 0x118)},
+    {"ft", dumpOff("Sky", "SkyboxFt", 0x148)}, {"lf", dumpOff("Sky", "SkyboxLf", 0x178)},
+    {"rt", dumpOff("Sky", "SkyboxRt", 0x1a8)}, {"up", dumpOff("Sky", "SkyboxUp", 0x1d8)}}
+
+local function skyboxAssetId(v)
+    v = tostring(v):match("^%s*(.-)%s*$")
+    if v:find("://") then return v end
+    local digits = v:match("^(%d+)$")
+    return digits and ("rbxassetid://" .. digits) or nil
+end
+
+-- Returns patched, note, refused (true when the sky was turned down).
+local function applySkybox(conf)
+    -- A face is an MSVC std::string: the text at +0 (inline when the
+    -- capacity is 15 or less, otherwise a pointer to it), length at +16,
+    -- capacity at +24. Only a heap string that holds an image path is read
+    -- or rewritten, and only with text that fits its buffer.
+    local function isImagePath(s)
+        return (s:find("^rbxasset") or s:find("^https?://")) and not s:find("[^\32-\126]") and true or false
+    end
+    local function readFace(base)
+        local size, cap, ptr = rd(base + 16), rd(base + 24), rd(base)
+        if not size or not cap or not ptr or size < 1 or cap < 16 or cap > 0x1000 or size > cap or ptr < 0x10000 then return nil end
+        local ok, s = pcall(mrd, "string", ptr)
+        if not ok or type(s) ~= "string" or #s < size then return nil end
+        s = s:sub(1, size)
+        if not isImagePath(s) then return nil end
+        return s, ptr, cap
+    end
+    -- Only text readFace would accept back is written, so every write can be
+    -- undone. Each face also records which kind of address it holds, which
+    -- an in-place write can't change: rbxasset://sky/sky512_up.tex written
+    -- over an rbxassetid:// face was read as asset id "y/sky512_up.tex" and
+    -- crashed the game. So the new text must use the face's own scheme -
+    -- except when putting back a face's original image number (restoring),
+    -- the kind every map sky records, even over an old Classic write.
+    local function writeFace(base, str, restoring)
+        local cur, ptr, cap = readFace(base)
+        if not cur or #str > cap or not isImagePath(str) then return false end
+        if not restoring and (cur:match("^(%a+://)") or "") ~= (str:match("^(%a+://)") or "?") then return false end
+        for i = 1, #str do
+            if not pcall(mwr, "byte", ptr + i - 1, string.byte(str, i)) then
+                -- Half a new id could name some other image; put the old one back.
+                for j = 1, i - 1 do pcall(mwr, "byte", ptr + j - 1, string.byte(cur, j) or 0) end
+                return false
+            end
+        end
+        pcall(mwr, "byte", ptr + #str, 0)
+        wr(base + 16, #str)
+        return true
+    end
+
+    -- Put back the faces an earlier run in this server wrote, where they
+    -- still hold what it wrote, so Off or another sky needs no rejoin.
+    -- (_G is lost when Matcha restarts; rejoining always resets the skies.)
+    -- A face that still holds what was written but can't be put back stays
+    -- remembered for the next run. Only an image number may be put back over
+    -- a different scheme: an older changer that wrote over an unremembered
+    -- Classic sky recorded Classic's rbxasset:// text as the original, and
+    -- writing that back would crash the game, so the face keeps its image.
+    local restored, kept = 0, {}
+    local prev = _G.__RIVALS_SKY_WRITES
+    _G.__RIVALS_SKY_WRITES = nil
+    for addr, w in pairs(type(prev) == "table" and prev or {}) do
+        if type(w) == "table" and type(w[1]) == "string" and readFace(addr) == w[2] then
+            local toId = w[1]:find("^rbxassetid://%d+$") ~= nil
+            if writeFace(addr, w[1], toId) then restored = restored + 1 elseif toId then kept[addr] = w end
+        end
+    end
+    if next(kept) then _G.__RIVALS_SKY_WRITES = kept end
+    local restoredNote = restored > 0 and "the game's own skies are back from the next map load" or nil
+
+    -- Only the map templates are rewritten, never the sky being drawn in
+    -- Lighting: a map load clones a template there, so the live sky gains
+    -- nothing from the change. Rewriting it did harm: the next map load
+    -- destroys it and frees its textures under the new ids, which the game
+    -- never loaded - the likely reason a sky with images the game hadn't
+    -- preloaded (the uploaded ones) crashed it, while its own skies didn't.
+    local lighting = game:GetService("Lighting").Address
+    local skies, seen = {}, {}
+    local function add(inst)
+        if inst and inst.ClassName == "Sky" and inst.Address and not seen[inst.Address] then
+            local parent = inst.Parent
+            if parent and parent.Address == lighting then return end
+            seen[inst.Address] = true
+            skies[#skies + 1] = inst
+        end
+    end
+    local roots = {}
+    local playerScripts = LP:FindFirstChild("PlayerScripts")
+    local starterScripts = game:GetService("StarterPlayer"):FindFirstChild("StarterPlayerScripts")
+
+    if playerScripts then roots[#roots + 1] = playerScripts end
+    if starterScripts then roots[#roots + 1] = starterScripts end
+    for _, root in ipairs(roots) do
+        for _, sub in ipairs({"Assets", "Modules"}) do
+            local folder = root:FindFirstChild(sub)
+            local profiles = folder and folder:FindFirstChild("LightingProfiles")
+            for _, prof in ipairs(profiles and profiles:GetChildren() or {}) do
+                for _, c in ipairs(prof:GetChildren()) do add(c) end
+            end
+        end
+    end
+
+    if not playerScripts then
+        for _, d in ipairs(LP:GetDescendants()) do
+            local profiles = d.Parent and d.Parent.Parent
+            if profiles and profiles.Name == "LightingProfiles" then add(d) end
+        end
+    end
+
+
+    -- A template still holding Classic's files that nothing remembers (Matcha
+    -- restarted since an older version wrote them) will crash the next map
+    -- load; only a rejoin clears it, so every outcome below says so.
+    local oldClassic = false
+    for _, d in ipairs(skies) do
+        for _, f in ipairs(SKYBOX_FACES) do
+            local s = readFace(d.Address + f[2])
+            if s and s:find("^rbxasset://sky/sky512_") then oldClassic = true end
+        end
+    end
+    local classicNote = oldClassic and "an older run's Classic sky is still in the map skies - rejoin before the next map load, or the game will crash" or nil
+    local function withClassic(note)
+        return classicNote and ((note and (note .. ". Also, ") or "") .. classicNote) or note
+    end
+
+    local ids = {}
+    local preset = conf.preset or conf.skybox or conf.name
+    -- "gray" is Roblox's DebugSkyGray render flag, not a set of images: it
+    -- greys the sky at once, on every map. Any other choice turns it off.
+    local gray = preset and tostring(preset):lower() == "gray"
+    if type(setfflag) == "function" then pcall(setfflag, "DebugSkyGray", gray and 1 or 0) end
+    if gray then return 0, withClassic("gray sky on - shows straight away"), classicNote and true or nil end
+    if preset then
+        local p = SKYBOX_PRESETS[tostring(preset):lower()]
+        if not p and tostring(preset):lower() == "classic" then
+            conf.__refused = true
+            return 0, withClassic("the Classic sky is gone: its images are rbxasset:// files that ship with Roblox, while the map "
+                .. "skies hold rbxassetid:// ids, and Roblox read the one as the other and crashed. Pick another sky"), true
+        end
+        if not p then return 0, withClassic("unknown skybox preset '" .. tostring(preset) .. "'"), classicNote and true or nil end
+        for i, v in ipairs(p) do ids[i] = skyboxAssetId(v) end
+    end
+    local all = conf.all and skyboxAssetId(conf.all)
+    if all then for i = 1, 6 do ids[i] = all end end
+    for i, f in ipairs(SKYBOX_FACES) do
+        local one = conf[f[1]] and skyboxAssetId(conf[f[1]])
+        if one then ids[i] = one end
+    end
+
+    local given = 0
+    for i = 1, 6 do if ids[i] then given = given + 1 end end
+    if given == 0 then return 0, withClassic(restoredNote), classicNote and true or nil end
+
+    -- Only images from the skies listed above are written: the game's own
+    -- and the uploaded ones. Since Roblox build cec3ad5 (Oct 2026) a sky
+    -- the game can't load crashes it on the next map load, so an image id
+    -- from anywhere else is turned down. The id decides, not the preset
+    -- name, so All= and per-face lines are held to the same rule. Force=yes
+    -- writes them anyway, to test a sky.
+    local safe = {}
+    for _, faces in pairs(SKYBOX_PRESETS) do
+        for _, v in ipairs(faces) do safe[skyboxAssetId(v)] = true end
+    end
+    local force = tostring(conf.force or ""):lower():match("^%s*(%w+)")
+    force = force == "yes" or force == "true" or force == "on" or force == "1"
+    -- The map skies hold rbxassetid:// ids, and a face can't change the kind
+    -- of address it holds (see writeFace), so anything else - a local
+    -- rbxasset:// file or an http link - is turned down even with Force=yes.
+    for i = 1, 6 do
+        if ids[i] and not ids[i]:find("^rbxassetid://%d+$") then
+            conf.__refused = true
+            return 0, withClassic((preset and ("the '" .. tostring(preset) .. "' sky") or "the custom sky") .. " was not applied: '"
+                .. ids[i] .. "' isn't an rbxassetid:// image id, and the map skies can only take those - Roblox "
+                .. "reads anything else as a broken asset id and crashes. Use the image's number"), true
+        end
+    end
+    local foreign = 0
+    for i = 1, 6 do if ids[i] and not safe[ids[i]] then foreign = foreign + 1 end end
+    if foreign > 0 and not force then
+        conf.__refused = true
+        return 0, withClassic((preset and ("the '" .. tostring(preset) .. "' sky") or "the custom sky") .. " was not applied: "
+            .. foreign .. " of its faces aren't images from the changer's skies, and since Roblox build cec3ad5 a sky "
+            .. "the game can't load crashes it on the next map load. Pick one of the listed skies, or add Force=yes "
+            .. "under [Skybox] to try it anyway"), true
+    end
+
+    -- A template takes all the faces given or none of them, and every
+    -- change is remembered so the next run can put it back.
+    local patched, skipped, writes = 0, 0, {}
+    for _, d in ipairs(skies) do
+        local done = {}
+        for i, f in ipairs(SKYBOX_FACES) do
+            local addr = d.Address + f[2]
+            local orig = ids[i] and readFace(addr)
+            if orig and writeFace(addr, ids[i]) then done[#done + 1] = {addr, orig, ids[i]} end
+        end
+        if #done == given then
+            patched = patched + 1
+            for _, w in ipairs(done) do
+                if w[2] ~= w[3] then writes[w[1]] = {w[2], w[3]} end
+            end
+        else
+            skipped = skipped + 1
+            for _, w in ipairs(done) do writeFace(w[1], w[2], true) end
+        end
+    end
+    if next(writes) then
+        -- A face still remembered from a restore that failed keeps its
+        -- original, so a later undo goes back to the game's image.
+        local all = _G.__RIVALS_SKY_WRITES or {}
+        for addr, w in pairs(writes) do
+            local k = all[addr]
+            if k and k[2] == w[1] then w = {k[1], w[2]} end
+            all[addr] = w[1] ~= w[2] and w or nil
+        end
+        _G.__RIVALS_SKY_WRITES = next(all) and all or nil
+    end
+    if patched == 0 then
+        return 0, withClassic(skipped > 0 and (skipped .. " sky templates couldn't hold the new images - left as they were") or "no sky templates found"),
+            classicNote and true or nil
+    end
+    return patched, withClassic((skipped > 0) and (skipped .. " sky templates were left alone (a face couldn't hold the new image)") or nil),
+        classicNote and true or nil
+end
+
+-- Hit, headshot and kill sounds
+-- ClientViewModel.PlayHitmarkerSound hands plain string constants to
+-- CreateSound: "...13110130082" on a body hit, "...16537449730" layered with
+-- "...16537337310" on a headshot. Kill sounds come from
+-- SoundLibrary.EliminationSounds. Luau interns strings, so each id is a
+-- single object, and SoundLibrary lists all of them (AlwaysPreload,
+-- EliminationSounds) - that is how they are found. Rewriting an object's
+-- text changes what the next CreateSound plays. Each sits in a 56-byte
+-- block: text at +24, length at +20, room for 31 characters.
+local SOUND_TARGETS = {
+    ["rbxassetid://13110130082"] = "hit",
+    ["rbxassetid://16537449730"] = "critical",
+    ["rbxassetid://16537337310"] = "criticallayer",
+    ["rbxassetid://16530229616"] = "kill",
+    ["rbxassetid://16530229541"] = "kill",
+    ["rbxassetid://16530229695"] = "kill",
+}
+local SOUND_TEXT_MAX, SOUND_LEN, TAG_STRING = 31, 20, 6
+
+-- nil = keep the game's sound, "" = silence, false = not usable.
+local function soundText(v)
+    v = tostring(v):match("^%s*(.-)%s*$")
+    local low = v:lower()
+    if low == "" or low == "default" then return nil end
+    if low == "none" or low == "mute" or low == "off" then return "" end
+    local id = skyboxAssetId(v)
+    if id and #id <= SOUND_TEXT_MAX then return id end
+    return false
+end
+
+local function writeLuaString(ts, text)
+    if #text > SOUND_TEXT_MAX then return false end
+    for i = 1, #text do mwr("byte", ts + STRING_DATA + i - 1, string.byte(text, i)) end
+    mwr("byte", ts + STRING_DATA + #text, 0)
+    mwr("int", ts + SOUND_LEN, #text)
+    return true
+end
+
+local function collectSoundStrings(out, tbl, depth)
+    local size, arr = rint(tbl + ROUTE.sizearray), rd(tbl + ROUTE.array)
+    if not size or not arr or size < 1 or size > 256 or arr < 0x10000 then return end
+    for i = 0, size - 1 do
+        local v = arr + i * 16
+        local tag, p = rint(v + 12), rd(v)
+        if tag == TAG_STRING and p and p > 0x10000 then
+            local ok, s = pcall(mrd, "string", p + STRING_DATA)
+            if ok and SOUND_TARGETS[s] then out[s] = p end
+        elseif tag == TAG_TABLE and depth > 0 and p and p > 0x10000 then
+            collectSoundStrings(out, p, depth - 1)
+        end
+    end
+end
+
+local function applySounds(conf)
+    -- Put back the text the last run wrote, where it is still ours.
+    local prev = _G.__RIVALS_SOUND_STATE
+    _G.__RIVALS_SOUND_STATE = nil
+    for _, r in ipairs(type(prev) == "table" and prev.restores or {}) do
+        local ok, now = pcall(mrd, "string", r[1] + STRING_DATA)
+        if ok and now == r[3] then writeLuaString(r[1], r[2]) end
+    end
+
+    local want, bad = {}, {}
+    for key, value in pairs(conf) do
+        if key == "hit" or key == "critical" or key == "kill" then
+            local text = soundText(value)
+            if text == false then
+                bad[#bad + 1] = key .. "=" .. tostring(value)
+            elseif text then
+                want[key] = text
+            end
+        end
+    end
+    -- A custom headshot replaces the layered pair, so its second layer goes quiet.
+    if want.critical then want.criticallayer = "" end
+    if not next(want) then return 0, (#bad > 0) and ("not an audio id: " .. table.concat(bad, ", ")) or nil end
+
+    local modules = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+    local f = nodesOf(moduleTable(modules and modules:FindFirstChild("SoundLibrary")), 64,
+        {AlwaysPreload = true, EliminationSounds = true})
+    local found = {}
+    for _, node in pairs(f or {}) do
+        local t = rd(node)
+        if t and t > 0x10000 then collectSoundStrings(found, t, 1) end
+    end
+
+    local restores, changed = {}, 0
+    for original, ts in pairs(found) do
+        local text = want[SOUND_TARGETS[original]]
+        if text and writeLuaString(ts, text) then
+            restores[#restores + 1] = {ts, original, text}
+            changed = changed + 1
+        end
+    end
+    _G.__RIVALS_SOUND_STATE = {restores = restores}
+    if changed == 0 then
+        return 0, "sounds not found - rejoin if an earlier run already changed them"
+    end
+    return changed, (#bad > 0) and ("not an audio id: " .. table.concat(bad, ", ")) or nil
+end
+
+-- Sound volume. Every audio file has its own loudness while Rivals plays each
+-- at a fixed volume, so custom sounds come out louder or quieter. The game
+-- creates each hit, headshot and kill sound fresh, parented to the script
+-- that plays it (ClientViewModel for hits, EliminationSlots for kills); a
+-- light watcher scales new ones by the chosen multiplier. Volume is a float
+-- on the Sound (offset from the dump, 0x120 on build cec3ad5).
+local SOUND_VOLUME_OFF = dumpOff("Sound", "Volume", 0x120)
+local SOUND_ID_OFF = dumpOff("Sound", "SoundId", 0xb8)
+local DEFAULT_SOUND_TEXT = {
+    hit = {"rbxassetid://13110130082"},
+    critical = {"rbxassetid://16537449730"},
+    kill = {"rbxassetid://16530229616", "rbxassetid://16530229541", "rbxassetid://16530229695"},
+}
+
+local function startVolumeWatcher(conf)
+    _G.__RIVALS_SOUND_WATCH = (_G.__RIVALS_SOUND_WATCH or 0) + 1
+    local token = _G.__RIVALS_SOUND_WATCH
+    local gains = {}
+    for _, slot in ipairs({"hit", "critical", "kill"}) do
+        local g = tonumber(tostring(conf[slot .. "volume"] or ""):match("[%d%.]+"))
+        if g then
+            if g > 5 then g = g / 100 end  -- "150" means 150%
+            g = math.clamp(g, 0, 5)
+            if g ~= 1 then
+                local custom = soundText(conf[slot] or "")
+                local texts = custom and custom ~= "" and {custom} or DEFAULT_SOUND_TEXT[slot]
+                for _, t in ipairs(texts) do gains[t] = g end
+            end
+        end
+    end
+    if not next(gains) then return 0 end
+
+    local fighter = LP.PlayerScripts:FindFirstChild("Modules")
+    fighter = fighter and fighter:FindFirstChild("ClientReplicatedClasses")
+    fighter = fighter and fighter:FindFirstChild("ClientFighter")
+    local item = fighter and fighter:FindFirstChild("ClientItem")
+    local ui = fighter and fighter:FindFirstChild("FighterInterface")
+    local parents = {item and item:FindFirstChild("ClientViewModel"), ui and ui:FindFirstChild("EliminationSlots")}
+    -- A Heartbeat connection rather than a spawned loop: Matcha stops resuming
+    -- a thread's task.wait once the changer run that spawned it has ended.
+    if _G.__RIVALS_SOUND_CONN then pcall(function() _G.__RIVALS_SOUND_CONN:Disconnect() end) end
+    local seen = {}
+    _G.__RIVALS_SOUND_CONN = game:GetService("RunService").Heartbeat:Connect(function()
+        if _G.__RIVALS_SOUND_WATCH ~= token then return end
+        local now = tick()
+        for _, parent in ipairs(parents) do
+            if parent then
+                for _, s in ipairs(parent:GetChildren()) do
+                    local a = s.ClassName == "Sound" and s.Address
+                    if a and not seen[a] then
+                        seen[a] = now
+                        local ok, text = pcall(mrd, "string", rd(a + SOUND_ID_OFF))
+                        local g = ok and gains[text]
+                        if g then
+                            -- Only a value that looks like a volume (0-10): anything else
+                            -- means the offset doesn't fit this Roblox build.
+                            local okV, v = pcall(mrd, "float", a + SOUND_VOLUME_OFF)
+                            if okV and type(v) == "number" and v >= 0 and v <= 10 then
+                                pcall(mwr, "float", a + SOUND_VOLUME_OFF, math.min(v * g, 10))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- Sounds live at most 10 s; forget old ones so a reused address counts again.
+        for a, t in pairs(seen) do if now - t > 15 then seen[a] = nil end end
+    end)
+    local n = 0
+    for _ in pairs(gains) do n = n + 1 end
+    return n
+end
+
+-- Spoof: your name, level, streak and badges as you see them. The server keeps
+-- the real ones, so only your screen changes - except Device, which is sent to
+-- the server and shows to everyone.
+--
+-- A label only redraws when the game sets its text (the glyphs are laid out
+-- right then), so rewriting a label's text in memory never shows properly.
+-- Instead the values are changed where the game reads them: your player's
+-- DisplayName (for every nametag, player list entry and profile it builds from
+-- then on) and the attributes it draws level, streak, ELO and badges from. The
+-- profile card's level and rank come from the server when it opens, so those
+-- stay real, and so does the @username (your account name).
+local SPOOF_ATTRS = {
+    level = "Level", streak = "StatisticDuelsWinStreak", elo = "DisplayELO",
+    influencer = "IsInfluencer", employee = "IsRobloxEmployee", trustworthy = "IsTrustWorthy",
+    -- The name effect (gold Prime, purple Contraband) on the nametag, player
+    -- list and profile: the game draws it from this attribute.
+    effect = "PlayerStatus",
+}
+local NAME_EFFECTS = {prime = "Prime", gold = "Prime", contraband = "Contraband", purple = "Contraband",
+    none = "", off = "", ["false"] = ""}
+local SPOOF_STATS = {level = "Level", streak = "Win Streak", elo = "Current ELO"}
+local DISPLAY_NAME_OFF = dumpOff("Player", "DisplayName", 0x128) -- Player.DisplayName, a std::string
+local GLYPHS, GLYPHS_END, GLYPH_SIZE = 0xc18, 0xc20, 56 -- laid-out glyphs, codepoint at +12
+local SPOOF_REAL_FILE = "rivals_spoof_real.txt"
+local DEVICES = {mousekeyboard = "MouseKeyboard", keyboard = "MouseKeyboard", pc = "MouseKeyboard",
+    touch = "Touch", mobile = "Touch", gamepad = "Gamepad", controller = "Gamepad", vr = "VR"}
+
+local function readStdString(a)
+    local size, cap = rd(a + 16), rd(a + 24)
+    if not size or not cap or size > 256 or cap < size then return nil end
+    local p = cap > 15 and rd(a) or a
+    local ok, s = pcall(mrd, "string", p)
+    return ok and type(s) == "string" and s:sub(1, size) or nil
+end
+local function writeStdString(a, text)
+    local cap = rd(a + 24)
+    if not cap or #text > cap then return false end
+    local p = cap > 15 and rd(a) or a
+    for i = 1, #text do mwr("byte", p + i - 1, string.byte(text, i)) end
+    mwr("byte", p + #text, 0)
+    wr(a + 16, #text)
+    return true
+end
+-- What a label actually shows: its laid-out glyphs, as text.
+local function shownText(label)
+    local b, e = rd(label.Address + GLYPHS), rd(label.Address + GLYPHS_END)
+    if not b or not e or e < b or e - b > GLYPH_SIZE * 64 then return nil end
+    local out = {}
+    for g = b, e - GLYPH_SIZE, GLYPH_SIZE do
+        local cp = rint(g + 12)
+        if cp ~= 0 then -- (0: padding left by patchGlyphs)
+            if not cp or cp < 32 or cp > 126 then return nil end
+            out[#out + 1] = string.char(cp)
+        end
+    end
+    return table.concat(out)
+end
+-- The profile card sets its level and rank from the server each time it
+-- opens, so the text can't be changed at the source. What can be changed is
+-- the result: the laid-out glyphs (glyph index at +8, character at +12), which
+-- is what gets drawn. Digits sit in order in the game's font, so a number
+-- becomes another by swapping glyph indices; other characters are looked up
+-- from glyphs already laid out on the card. It can't add glyphs, only reuse or
+-- drop them, so the new text can't be longer than the old one.
+local RANK_THRESHOLDS = {
+    {0, "Bronze 1", "rbxassetid://106623367501544"}, {200, "Bronze 2", "rbxassetid://131795064007344"},
+    {400, "Bronze 3", "rbxassetid://73543520622815"}, {600, "Silver 1", "rbxassetid://80716950169934"},
+    {800, "Silver 2", "rbxassetid://136100661820261"}, {1000, "Silver 3", "rbxassetid://107898816876115"},
+    {1200, "Gold 1", "rbxassetid://134520747948636"}, {1400, "Gold 2", "rbxassetid://114166096331502"},
+    {1600, "Gold 3", "rbxassetid://90039594400813"}, {1800, "Platinum 1", "rbxassetid://133903971285645"},
+    {2000, "Platinum 2", "rbxassetid://82834564754747"}, {2200, "Platinum 3", "rbxassetid://73345783863790"},
+    {2400, "Diamond 1", "rbxassetid://113997689031026"}, {2600, "Diamond 2", "rbxassetid://88059506918419"},
+    {2800, "Diamond 3", "rbxassetid://112183171942172"}, {3000, "Onyx 1", "rbxassetid://104871954739030"},
+    {3200, "Onyx 2", "rbxassetid://109012386782238"}, {3400, "Onyx 3", "rbxassetid://127982903682334"},
+    {3600, "Nemesis", "rbxassetid://116941545385923"},
+}
+local function rankFor(elo)
+    local pick = RANK_THRESHOLDS[1]
+    for _, r in ipairs(RANK_THRESHOLDS) do if elo >= r[1] then pick = r end end
+    return pick[2], pick[3]
+end
+local function glyphList(label)
+    local b, e = rd(label.Address + GLYPHS), rd(label.Address + GLYPHS_END)
+    if not b or not e or e < b or e - b > GLYPH_SIZE * 64 then return nil end
+    local list = {}
+    for g = b, e - GLYPH_SIZE, GLYPH_SIZE do
+        list[#list + 1] = {addr = g, width = rint(g + 4), glyph = rint(g + 8), cp = rint(g + 12)}
+    end
+    return list, b
+end
+-- Every label laid out on the card: its characters, their glyph index and
+-- width (each glyph carries its advance; the game spaces text by it).
+local function glyphMap(root)
+    local map = {glyph = {}, labels = {}}
+    for _, d in ipairs(root:GetDescendants()) do
+        if d.ClassName == "TextLabel" then
+            local widths = {}
+            for _, g in ipairs(glyphList(d) or {}) do
+                if g.cp and g.glyph and g.cp > 0 and g.cp < 128 then
+                    local c = string.char(g.cp)
+                    map.glyph[c] = g.glyph
+                    widths[c] = g.width
+                    local digit = g.cp - 48
+                    if digit >= 0 and digit <= 9 then map.zero = g.glyph - digit end
+                end
+            end
+            if next(widths) then map.labels[#map.labels + 1] = widths end
+        end
+    end
+    -- Digits sit in order in the font.
+    if map.zero then for dg = 0, 9 do map.glyph[tostring(dg)] = map.glyph[tostring(dg)] or map.zero + dg end end
+    return map
+end
+-- A character's width at a label's size: its own if it has it, otherwise
+-- another label's scaled by a character both have.
+local function widthFor(c, own, map)
+    if own[c] then return own[c] end
+    -- (scaled by every character both have, so one narrow letter can't skew it)
+    for _, other in ipairs(map.labels) do
+        if other[c] then
+            local mine, theirs = 0, 0
+            for k, w in pairs(own) do
+                if other[k] then mine, theirs = mine + w, theirs + other[k] end
+            end
+            if theirs > 0 then return math.floor(other[c] * mine / theirs + 0.5) end
+        end
+    end
+    local sum, n = 0, 0
+    for _, w in pairs(own) do sum, n = sum + w, n + 1 end
+    return n > 0 and math.floor(sum / n + 0.5) or nil
+end
+-- Make a label show `text` by rewriting its glyphs. When the text can't be
+-- shown (longer than the label's glyphs, or a character missing) the label is
+-- cleared, or left as it is with `keep`.
+local function patchGlyphs(label, text, map, keep)
+    local list, b = glyphList(label)
+    if not list or #list == 0 then return false end
+    local shown = {}
+    for _, g in ipairs(list) do
+        if g.cp ~= 0 then shown[#shown + 1] = string.char(math.max(0, math.min(255, g.cp or 63))) end
+    end
+    if table.concat(shown) == text then return true end
+    local ok = #text <= #list
+    local own = {}
+    for _, g in ipairs(list) do
+        if g.cp and g.cp > 0 and g.cp < 128 then own[string.char(g.cp)] = g.width end
+    end
+    local glyphs, widths = {}, {}
+    for i = 1, ok and #text or 0 do
+        local c = text:sub(i, i)
+        glyphs[i], widths[i] = map.glyph[c], widthFor(c, own, map)
+        if not glyphs[i] or not widths[i] then ok = false end
+    end
+    if not ok then
+        if not keep then wr(label.Address + GLYPHS_END, b) end -- nothing rather than the real value
+        return false
+    end
+    -- The glyph count can't shrink (the game puts the end back), so spare
+    -- glyphs go first as zero-width copies of the first character: drawn
+    -- exactly on top of it, they don't show.
+    local pad = #list - #text
+    -- Checked again right before writing: a label laid out again (or gone)
+    -- since it was read must not be written into.
+    local b2, e2 = rd(label.Address + GLYPHS), rd(label.Address + GLYPHS_END)
+    if b2 ~= b or e2 ~= b + #list * GLYPH_SIZE or rint(list[1].addr + 12) ~= list[1].cp then return false end
+    for i = 1, #list do
+        local j = i - pad
+        mwr("int", list[i].addr + 4, j >= 1 and widths[j] or 0)
+        mwr("int", list[i].addr + 8, glyphs[math.max(j, 1)])
+        mwr("int", list[i].addr + 12, j >= 1 and string.byte(text, j) or 0)
+    end
+    return true
+end
+-- Two labels' character -> glyph tables are from the same font when every
+-- character they share has the same glyph.
+local function sameFont(a, b)
+    local shared = 0
+    for c, g in pairs(a) do
+        if b[c] ~= nil then
+            if b[c] ~= g then return false end
+            shared = shared + 1
+        end
+    end
+    return shared >= 2
+end
+-- Every label's glyphs under some roots, as {glyph = char -> index, widths}.
+local function glyphSamples(roots)
+    local out = {}
+    for _, root in ipairs(roots) do
+        for _, d in ipairs(root:GetDescendants()) do
+            if d.ClassName == "TextLabel" then
+                local s = {glyph = {}, widths = {}}
+                for _, g in ipairs(glyphList(d) or {}) do
+                    if g.cp and g.glyph and g.cp > 32 and g.cp < 127 then
+                        local c = string.char(g.cp)
+                        s.glyph[c], s.widths[c] = g.glyph, g.width
+                    end
+                end
+                if next(s.glyph) then out[#out + 1] = s end
+            end
+        end
+    end
+    return out
+end
+local function prettyNumber(n)
+    local s = tostring(math.floor(n))
+    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (out:gsub("^,", ""))
+end
+
+local function spoofFlag(v)
+    local low = tostring(v or ""):lower()
+    if low == "true" or low == "1" or low == "on" or low == "yes" then return true end
+    if low == "false" or low == "0" or low == "off" or low == "no" then return false end
+    return nil
+end
+
+local function startSpoof(conf)
+    _G.__RIVALS_SPOOF = (_G.__RIVALS_SPOOF or 0) + 1
+    local token = _G.__RIVALS_SPOOF
+
+    -- The real values, read once before anything is changed. The display name
+    -- is also kept in a file: after a Matcha restart the player object may
+    -- still carry a spoofed one.
+    -- The DisplayName field sits at a fixed offset: it is only read or written
+    -- when it holds something that looks like a name and equals the property
+    -- (or the name this changer last wrote there); otherwise the offset
+    -- doesn't fit this build. Read byte by byte up to the string's own length,
+    -- since Matcha's string read stops at the first byte above 0x7E (a name
+    -- like "Niccolò" reads as "Niccol"). Without the property to compare
+    -- with, only a plain ASCII name is trusted.
+    local nameAddr = LP.Address + DISPLAY_NAME_OFF
+    local function nameBytes(n)
+        local cap = rd(nameAddr + 24)
+        local p = cap and (cap > 15 and rd(nameAddr) or nameAddr)
+        if not n or not cap or n > cap or not p or p == 0 then return nil end
+        local out = {}
+        for i = 0, n - 1 do
+            local ok, b = pcall(mrd, "byte", p + i)
+            if not ok or type(b) ~= "number" or b < 0 or b > 255 then return nil end
+            out[#out + 1] = string.char(b)
+        end
+        return table.concat(out)
+    end
+    local nameLen = rd(nameAddr + 16)
+    local nameNow = nameLen and nameLen >= 1 and nameLen <= 64 and nameBytes(nameLen) or nil
+    local okDN, dn = pcall(function() return LP.DisplayName end)
+    dn = okDN and type(dn) == "string" and dn ~= "" and dn or nil
+
+    local real = _G.__RIVALS_SPOOF_REAL
+    if not real or real.user ~= LP.Name then
+        real = {user = LP.Name, attrs = {}, stats = {}}
+        -- Older versions' file; their names can be cut short (see below).
+        local okF, saved = pcall(readfile, SPOOF_REAL_FILE)
+        local savedUser, savedName = (okF and type(saved) == "string" and saved or ""):match("^(.-)\n(.-)\n?$")
+        if savedUser == LP.Name and savedName and savedName ~= "" then real.display = savedName end
+        for key, attr in pairs(SPOOF_ATTRS) do real.attrs[key] = LP:GetAttribute(attr) end
+        real.effectRead = true
+        local ls = LP:FindFirstChild("CustomLeaderstats")
+        for key, stat in pairs(SPOOF_STATS) do
+            local v = ls and ls:FindFirstChild(stat)
+            if v then real.stats[key] = v.Value end
+        end
+        _G.__RIVALS_SPOOF_REAL = real
+    end
+
+    -- A record from before the effect existed has no real effect in it; none
+    -- was spoofed then, so what the player has now is the real one. No effect
+    -- is kept as "", which the game draws as nothing, so it can be put back.
+    if not real.effectRead then
+        real.attrs.effect, real.effectRead = LP:GetAttribute("PlayerStatus"), true
+    end
+    if real.attrs.effect == nil then real.attrs.effect = "" end
+
+    -- This version's name record, kept apart from the one above (older
+    -- versions read that, and expect their cut-short string read in it): the
+    -- real name, the name last written into the field, and the player object
+    -- it belongs to, in _G and in a file (a rerun, a Matcha restart). A new
+    -- player object means a rejoin, and a rejoin's field holds the game's name.
+    local nameFile = "rivals_spoof_name.txt"
+    local nm = _G.__RIVALS_SPOOF_NAME
+    if type(nm) ~= "table" or nm.user ~= LP.Name then
+        nm = {user = LP.Name}
+        local okN, rec = pcall(readfile, nameFile)
+        local u, d, w, lp = (okN and type(rec) == "string" and rec or ""):match("^(.-)\n(.-)\n(.-)\n(.-)\n?$")
+        if u == LP.Name and d ~= "" then nm.display, nm.wrote, nm.lp, nm.saved = d, w ~= "" and w or nil, tonumber(lp), rec end
+        _G.__RIVALS_SPOOF_NAME = nm
+    end
+    local function saveName()
+        local rec = LP.Name .. "\n" .. (nm.display or "") .. "\n" .. (nm.wrote or "") .. "\n"
+            .. (nm.lp and string.format("%.0f", nm.lp) or "") .. "\n"
+        if nm.display and rec ~= nm.saved then
+            nm.saved = rec
+            pcall(writefile, nameFile, rec)
+        end
+    end
+    local nameFits = nameNow and not nameNow:find("%c")
+        and (nameNow == dn or nameNow == nm.wrote or (not dn and nameNow == readStdString(nameAddr))) or false
+
+    local want = {
+        effect = conf.effect and NAME_EFFECTS[tostring(conf.effect):lower():gsub("%s", "")],
+        name = conf.name and conf.name ~= "" and conf.name or nil,
+        user = conf.username and conf.username:gsub("^@", "") ~= "" and (conf.username:gsub("^@", "")) or nil,
+        level = tonumber(conf.level), streak = tonumber(conf.streak), elo = tonumber(conf.elo),
+        influencer = spoofFlag(conf.influencer), employee = spoofFlag(conf.employee),
+        trustworthy = spoofFlag(conf.trustworthy),
+    }
+    local device = conf.device and DEVICES[conf.device:lower():gsub("[%s&/_-]", "")]
+    local any = device ~= nil
+    for _, v in pairs(want) do if v ~= nil then any = true end end
+
+    if nameFits and nm.lp ~= LP.Address then
+        local realName = nameNow
+        if not nm.display then
+            -- First run of this version: an older one's record can hold the
+            -- name cut short at its first non-ASCII byte ("Niccol", or "" for
+            -- "Ñandu") while the field holds it whole - or the field can hold
+            -- that version's spoof, and the record the real name.
+            local old = real.display
+            if old and #nameNow > #old and nameNow:sub(1, #old) == old and nameNow:byte(#old + 1) > 126
+                and nameNow ~= want.name then
+                old = nameNow
+            end
+            if old == "" then realName = nil end
+            realName = old ~= "" and old or realName
+        end
+        nm.display, nm.wrote, nm.lp = realName, nil, LP.Address
+        saveName()
+    end
+    -- Older versions get the real name in their own form when it's plain text.
+    if not real.display and nm.display and not nm.display:find("[^\32-\126]") then
+        real.display = nm.display
+        if not (isfile and isfile(SPOOF_REAL_FILE)) then
+            pcall(writefile, SPOOF_REAL_FILE, LP.Name .. "\n" .. nm.display .. "\n")
+        end
+    end
+
+    -- The name the player object should carry; the field has room for as many
+    -- characters as the real name's storage (15 for a short name).
+    local notes = {}
+    local shownName = nameFits and (want.name or nm.display) or nil
+    if want.name and not nameFits then
+        notes[#notes + 1] = "the display name field doesn't fit this Roblox build - name left alone"
+    end
+    local nameCap = nameFits and rd(LP.Address + DISPLAY_NAME_OFF + 24)
+    if shownName and want.name and nameCap and #want.name > nameCap then
+        notes[#notes + 1] = "name longer than " .. nameCap .. " characters - kept the real one"
+        shownName = nm.display
+    end
+    -- An older version's spoof of the same name can already be there.
+    if shownName and shownName ~= nm.display and nameNow == shownName and nm.wrote ~= shownName then
+        nm.wrote = shownName
+        saveName()
+    end
+    -- The @username is redrawn over the real one's glyphs, so it can't be
+    -- longer than the real one.
+    local realUser = "@" .. LP.Name
+    local shownUser = want.user and "@" .. want.user or realUser
+    if #shownUser > #realUser then
+        notes[#notes + 1] = "username longer than " .. #LP.Name .. " characters - kept the real one"
+        shownUser = realUser
+    end
+
+    local function applyValues()
+        for key, attr in pairs(SPOOF_ATTRS) do
+            local v = want[key]
+            if v == nil then v = real.attrs[key] end
+            if v ~= nil and LP:GetAttribute(attr) ~= v then pcall(LP.SetAttribute, LP, attr, v) end
+        end
+        local ls = LP:FindFirstChild("CustomLeaderstats")
+        for key, stat in pairs(SPOOF_STATS) do
+            local obj = ls and ls:FindFirstChild(stat)
+            local v = want[key] or real.stats[key]
+            if obj and v ~= nil and obj.Value ~= v then pcall(function() obj.Value = v end) end
+        end
+        if shownName and (rd(nameAddr + 16) ~= #shownName or nameBytes(#shownName) ~= shownName)
+            and writeStdString(nameAddr, shownName) then
+            nm.wrote = shownName ~= nm.display and shownName or nil
+            saveName()
+            -- The nametag and player list set your name again (through the
+            -- game, so it redraws) whenever PlayerStatus changes: change it
+            -- and put it back.
+            local status = LP:GetAttribute("PlayerStatus")
+            pcall(LP.SetAttribute, LP, "PlayerStatus", status == nil and "" or nil)
+            pcall(LP.SetAttribute, LP, "PlayerStatus", status)
+        end
+    end
+
+    -- Your name reaches the nametag, player list and profile through the
+    -- DisplayName above, whenever the game sets it (the nametag on every
+    -- status change, the profile on every opening, the player list when your
+    -- slot is made). Labels are never rewritten in memory for the name: the
+    -- player list's name layers are destroyed and remade whenever it opens,
+    -- and writing into one that just went away crashed the game.
+    -- The @username is your account name, which the game gets from the
+    -- server, so it can only be redrawn: its glyphs are swapped for the same
+    -- font's (its text stays real - that is how your own profile card is told
+    -- apart from others). Only on the nametag and profile card, which stay put.
+    local lastHeal = 0
+    local function mapFor(label, samples)
+        local own = {}
+        for _, g in ipairs(glyphList(label) or {}) do
+            if g.cp and g.cp > 32 and g.cp < 127 then own[string.char(g.cp)] = g.glyph end
+        end
+        local map = {glyph = {}, labels = {}}
+        for _, s in ipairs(samples) do
+            if sameFont(own, s.glyph) then
+                for c, g in pairs(s.glyph) do map.glyph[c] = map.glyph[c] or g end
+                map.labels[#map.labels + 1] = s.widths
+            end
+        end
+        return map
+    end
+    local function userSampleOf(label)
+        local s = {glyph = {}, widths = {}}
+        for _, g in ipairs(glyphList(label) or {}) do
+            if g.cp and g.cp > 32 and g.cp < 127 then
+                s.glyph[string.char(g.cp)], s.widths[string.char(g.cp)] = g.glyph, g.width
+            end
+        end
+        return s
+    end
+    local function heal()
+        local char = workspace:FindFirstChild(LP.Name)
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local tag = hrp and hrp:FindFirstChild("NametagGui")
+        if not tag then return end
+        local labels = {}
+        for _, d in ipairs(tag:GetDescendants()) do
+            if d.ClassName == "TextLabel" and d.Parent and d.Parent.Name ~= "_ITEMSTATUSCLONE" then
+                local okT, text = pcall(function() return d.Text end)
+                if okT and text == realUser then labels[#labels + 1] = d end
+            end
+        end
+        for _, d in ipairs(labels) do
+            local shows = shownText(d)
+            if shows == realUser and not real.userSample then real.userSample = userSampleOf(d) end
+            if shows and shows ~= shownUser then
+                local samples = glyphSamples({tag})
+                if real.userSample then table.insert(samples, 1, real.userSample) end
+                -- (straight after, so the label can't have gone in between)
+                if d.Parent then patchGlyphs(d, shownUser, mapFor(d, samples), true) end
+            end
+        end
+    end
+
+    local function pass()
+        local now = tick()
+        real.beat = now
+        pcall(applyValues)
+        if now - lastHeal > 3 then lastHeal = now; pcall(heal) end
+    end
+
+    -- The profile card keeps its frame between openings (parked in
+    -- Assets.Temp.Pages while closed) and lays its text out again each time it
+    -- opens, so it is checked every frame while it shows you.
+    -- The page is only made the first time it opens in a server, straight
+    -- into the open pages (MainFrame.Pages), and parked in Temp.Pages when
+    -- closed; it is looked for in both until found.
+    local parked, page
+    pcall(function() parked = LP.PlayerScripts.Assets.Temp.Pages end)
+    local wantLevel = want.level and prettyNumber(want.level)
+    local wantRank, wantRankImage
+    if want.elo then wantRank, wantRankImage = rankFor(want.elo) end
+    local cardMap
+    local function profilePass()
+        if not (wantLevel or wantRank or shownUser ~= realUser) or not parked then return end
+        if not page then
+            page = parked:FindFirstChild("ViewProfile")
+            if not page then
+                local open = LP.PlayerGui:FindFirstChild("MainGui")
+                open = open and open:FindFirstChild("MainFrame")
+                open = open and open:FindFirstChild("Pages")
+                page = open and open:FindFirstChild("ViewProfile")
+            end
+            if not page then return end
+        end
+        if page.Parent == parked then cardMap = nil return end -- closed
+        local player = page:FindFirstChild("Active")
+        player = player and player:FindFirstChild("Player")
+        local user = player and player:FindFirstChild("Username")
+        local okU, userText = pcall(function() return user.Text end)
+        if not okU or userText ~= realUser then return end -- someone else's profile
+        if not cardMap then
+            if not real.userSample and shownText(user) == realUser then
+                real.userSample = {glyph = {}, widths = {}}
+                for _, g in ipairs(glyphList(user) or {}) do
+                    if g.cp and g.cp > 32 and g.cp < 127 then
+                        real.userSample.glyph[string.char(g.cp)] = g.glyph
+                        real.userSample.widths[string.char(g.cp)] = g.width
+                    end
+                end
+            end
+            cardMap = glyphMap(page)
+            if real.userSample then -- your real username's letters, to put it back
+                for c, g in pairs(real.userSample.glyph) do cardMap.glyph[c] = cardMap.glyph[c] or g end
+                cardMap.labels[#cardMap.labels + 1] = real.userSample.widths
+            end
+        end
+        if shownText(user) ~= shownUser then patchGlyphs(user, shownUser, cardMap, true) end
+        local bragging = player:FindFirstChild("Bragging")
+        if not bragging then return end
+        local level = bragging:FindFirstChild("Level")
+        level = level and level:FindFirstChild("Value")
+        if level and wantLevel then patchGlyphs(level, wantLevel, cardMap) end
+        local rank = bragging:FindFirstChild("Rank")
+        if rank and wantRank then
+            local title = rank:FindFirstChild("Title")
+            if title then patchGlyphs(title, wantRank, cardMap) end
+            -- The icon's image, wherever the ImageLabel keeps it (images do
+            -- redraw from memory, unlike text).
+            local container = rank:FindFirstChild("Container")
+            for _, d in ipairs(container and container:GetDescendants() or {}) do
+                if d.ClassName == "ImageLabel" and d.Name == "Icon" then
+                    for _, off in ipairs({IMG_OFF, 0xA18, 0xA10}) do
+                        local current = readStdString(d.Address + off)
+                        if current and current:find("^rbxasset") then
+                            if current ~= wantRankImage then writeStdString(d.Address + off, wantRankImage) end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Driven by Heartbeat, not a spawned loop: Matcha stops resuming a
+    -- thread's task.wait once the changer run that spawned it has ended, while
+    -- connections keep firing (the icon sync works the same way). The game can
+    -- reset the attributes, so they are put back every half second.
+    if _G.__RIVALS_SPOOF_CONN then pcall(function() _G.__RIVALS_SPOOF_CONN:Disconnect() end) end
+    _G.__RIVALS_SPOOF_CONN = nil
+    local okFirst, firstErr = pcall(pass) -- once now, so clearing it restores straight away
+    if not okFirst then print("[RivalsSkinChanger] Spoof: " .. tostring(firstErr)) end
+    if any then
+        local lastRun, lastError = tick(), nil
+        _G.__RIVALS_SPOOF_CONN = game:GetService("RunService").Heartbeat:Connect(function()
+            if _G.__RIVALS_SPOOF ~= token then return end
+            pcall(profilePass)
+            local now = tick()
+            if now - lastRun < 0.5 then return end
+            lastRun = now
+            -- One bad pass (a page closing mid-read) must not stop the next.
+            local ok, err = pcall(pass)
+            if not ok and tostring(err) ~= lastError then
+                lastError = tostring(err)
+                print("[RivalsSkinChanger] Spoof: " .. lastError)
+            end
+        end)
+    end
+
+    if device then
+        local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+        local rep = remotes and remotes:FindFirstChild("Replication")
+        local fighter = rep and rep:FindFirstChild("Fighter")
+        local setControls = fighter and fighter:FindFirstChild("SetControls")
+        local okF, err = false, "SetControls not found"
+        if setControls then okF, err = pcall(function() setControls:FireServer(device) end) end
+        notes[#notes + 1] = okF and ("device shown as " .. device)
+            or ("device not changed (needs Matcha's Hybrid Mode): " .. tostring(err):sub(1, 60))
+    end
+    if want.name then notes[#notes + 1] = "the name shows on your nametag and profile; the Tab list keeps the real one until it remakes your slot (next join)" end
+    return any, #notes > 0 and table.concat(notes, "; ") or nil
+end
+
+-- Lighting
+local LIGHTING_FIELDS = {
+    brightness = {off = dumpOff("Lighting", "Brightness", 0x108), key = "Brightness"},
+    exposure = {off = dumpOff("Lighting", "ExposureCompensation", 0x114), key = "ExposureCompensation"},
+    diffuse = {off = dumpOff("Lighting", "EnvironmentDiffuseScale", 0x10c), key = "EnvironmentDiffuseScale"},
+    specular = {off = dumpOff("Lighting", "EnvironmentSpecularScale", 0x110), key = "EnvironmentSpecularScale"},
+    shadowsoftness = {off = nil, key = "ShadowSoftness"},
+    ambient = {off = dumpOff("Lighting", "Ambient", 0xc0), key = "Ambient", color = true},
+    outdoor = {off = dumpOff("Lighting", "OutdoorAmbient", 0xf0), key = "OutdoorAmbient", color = true},
+    fogcolor = {off = dumpOff("Lighting", "FogColor", 0xe4), key = "FogColor", color = true}
+}
+local LIGHTING_PRESETS = {
+    ["dark"] = {brightness = 0.35, exposure = -1.3, diffuse = 0.15, specular = 0.2, ambient = 0.02, outdoor = 0.03, fogcolor = 0.02},
+    -- The game's own skies, tuned by hand to each sky's colours.
+    ["blue"] = {brightness = 2.2, exposure = 0.1, diffuse = 1, specular = 1, ambient = "#4a4f58", outdoor = "#8a93a3", fogcolor = "#bfd2e8"},
+    ["classic"] = {brightness = 2, exposure = 0, diffuse = 1, specular = 1, ambient = "#4c5058", outdoor = "#8c96a8", fogcolor = "#c0d0e8"},
+    ["space"] = {brightness = 0.6, exposure = -0.5, diffuse = 1, specular = 1, ambient = "#1c1630", outdoor = "#3a2f5c", fogcolor = "#0c0918"},
+    ["graveyard"] = {brightness = 0.8, exposure = -0.4, diffuse = 1, specular = 1, ambient = "#26302a", outdoor = "#46584c", fogcolor = "#3b4a40"},
+    ["sudden death"] = {brightness = 1.2, exposure = -0.2, diffuse = 1, specular = 1, ambient = "#3a1c1c", outdoor = "#6e3434", fogcolor = "#7a2e2a"},
+    ["station"] = {brightness = 1.8, exposure = 0, diffuse = 1, specular = 1, ambient = "#4a3a36", outdoor = "#8a6e66", fogcolor = "#d19a86"},
+    ["westown"] = {brightness = 2.4, exposure = 0.15, diffuse = 1, specular = 1, ambient = "#554536", outdoor = "#9c8466", fogcolor = "#e0c29a"},
+    ["black"] = {brightness = 0.35, exposure = -1.3, diffuse = 0.15, specular = 0.2, ambient = 0.02, outdoor = 0.03, fogcolor = 0.02},
+    ["gray"] = {brightness = 1.6, exposure = -0.05, diffuse = 1, specular = 1, ambient = "#4a4a4a", outdoor = "#808080", fogcolor = "#9a9a9a"},
+    -- One per uploaded sky, from its colours (tools/skies/lighting_from_skies.py).
+    -- "Preset=match" picks the one named like the current skybox.
+    ["cloudy 01"] = {brightness = 1.85, exposure = 0.05, diffuse = 1, specular = 1, ambient = "#443b39", outdoor = "#767278", fogcolor = "#aa8782"},
+    ["cloudy 02"] = {brightness = 2.73, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#565149", outdoor = "#908c83", fogcolor = "#c9b89b"},
+    ["cloudy 03"] = {brightness = 2.28, exposure = 0.27, diffuse = 1, specular = 1, ambient = "#4f4745", outdoor = "#908680", fogcolor = "#ac938b"},
+    ["cloudy 04"] = {brightness = 2.52, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#4b5153", outdoor = "#7f8ea4", fogcolor = "#d7f0fd"},
+    ["cloudy 05"] = {brightness = 2.41, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#484e51", outdoor = "#7d8ea7", fogcolor = "#cde8fa"},
+    ["cloudy 06"] = {brightness = 1.95, exposure = 0.1, diffuse = 1, specular = 1, ambient = "#3b4045", outdoor = "#67799d", fogcolor = "#c7e4fb"},
+    ["cloudy 07"] = {brightness = 2.12, exposure = 0.19, diffuse = 1, specular = 1, ambient = "#48434a", outdoor = "#847d91", fogcolor = "#cdb8d5"},
+    ["cloudy 08"] = {brightness = 2.29, exposure = 0.27, diffuse = 1, specular = 1, ambient = "#494948", outdoor = "#838992", fogcolor = "#c7c8c3"},
+    ["cloudy 09"] = {brightness = 2.01, exposure = 0.13, diffuse = 1, specular = 1, ambient = "#48412c", outdoor = "#7d7b76", fogcolor = "#b0994b"},
+    ["cloudy 10"] = {brightness = 1.8, exposure = 0.03, diffuse = 1, specular = 1, ambient = "#3a3c3b", outdoor = "#6c7273", fogcolor = "#6c736f"},
+    ["cloudy 11"] = {brightness = 1.21, exposure = -0.27, diffuse = 1, specular = 1, ambient = "#2e2842", outdoor = "#595073", fogcolor = "#5b4a97"},
+    ["cloudy 12"] = {brightness = 1.05, exposure = -0.35, diffuse = 1, specular = 1, ambient = "#28262a", outdoor = "#4e4b5f", fogcolor = "#655b6c"},
+    ["cloudy 13"] = {brightness = 1.83, exposure = 0.04, diffuse = 1, specular = 1, ambient = "#423b36", outdoor = "#7d7067", fogcolor = "#c2a692"},
+    ["cloudy 14"] = {brightness = 2.01, exposure = 0.13, diffuse = 1, specular = 1, ambient = "#374539", outdoor = "#678271", fogcolor = "#8ccd96"},
+    ["cloudy 15"] = {brightness = 0.91, exposure = -0.42, diffuse = 1, specular = 1, ambient = "#232229", outdoor = "#4c4544", fogcolor = "#3b374b"},
+    ["cloudy 16"] = {brightness = 2.02, exposure = 0.14, diffuse = 1, specular = 1, ambient = "#41414d", outdoor = "#787a94", fogcolor = "#a9aadc"},
+    ["cloudy 17"] = {brightness = 1.54, exposure = -0.1, diffuse = 1, specular = 1, ambient = "#433031", outdoor = "#72606c", fogcolor = "#ab696a"},
+    ["cloudy 18"] = {brightness = 1.54, exposure = -0.1, diffuse = 1, specular = 1, ambient = "#353435", outdoor = "#60656f", fogcolor = "#928f93"},
+    ["cloudy 19"] = {brightness = 1.55, exposure = -0.1, diffuse = 1, specular = 1, ambient = "#4a2f2d", outdoor = "#8b5b56", fogcolor = "#ac5753"},
+    ["cloudy 20"] = {brightness = 2.44, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#4c4d55", outdoor = "#8b8c97", fogcolor = "#9597af"},
+    ["cloudy 21"] = {brightness = 1.65, exposure = -0.05, diffuse = 1, specular = 1, ambient = "#4f3221", outdoor = "#856540", fogcolor = "#ab5928"},
+    ["cloudy 22"] = {brightness = 1.23, exposure = -0.26, diffuse = 1, specular = 1, ambient = "#41271e", outdoor = "#744f3f", fogcolor = "#b05335"},
+    ["cloudy 23"] = {brightness = 2.0, exposure = 0.13, diffuse = 1, specular = 1, ambient = "#493f41", outdoor = "#8f747d", fogcolor = "#c39aa4"},
+    ["cloudy 24"] = {brightness = 2.3, exposure = 0.28, diffuse = 1, specular = 1, ambient = "#4c4947", outdoor = "#918787", fogcolor = "#9e938e"},
+    ["cloudy 25"] = {brightness = 1.74, exposure = -0.0, diffuse = 1, specular = 1, ambient = "#3b393f", outdoor = "#706c7b", fogcolor = "#9791a6"},
+    ["aurora"] = {brightness = 1.02, exposure = -0.36, diffuse = 1, specular = 1, ambient = "#182a23", outdoor = "#365340", fogcolor = "#2b7558"},
+    ["beautiful"] = {brightness = 1.39, exposure = -0.18, diffuse = 1, specular = 1, ambient = "#203341", outdoor = "#2765b1", fogcolor = "#49a8ed"},
+    ["black hole"] = {brightness = 1.17, exposure = -0.29, diffuse = 1, specular = 1, ambient = "#39261f", outdoor = "#6b4d43", fogcolor = "#75422c"},
+    ["blue sky"] = {brightness = 2.43, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#3f505b", outdoor = "#6993b6", fogcolor = "#83bee6"},
+    ["broken sky"] = {brightness = 2.68, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#505253", outdoor = "#8d8c8a", fogcolor = "#adb2b5"},
+    ["castle grounds"] = {brightness = 2.14, exposure = 0.2, diffuse = 1, specular = 1, ambient = "#31485c", outdoor = "#4b8cb4", fogcolor = "#54a1e4"},
+    ["chill gray"] = {brightness = 1.57, exposure = -0.09, diffuse = 1, specular = 1, ambient = "#333536", outdoor = "#636668", fogcolor = "#565b5d"},
+    ["chill pink"] = {brightness = 1.67, exposure = -0.04, diffuse = 1, specular = 1, ambient = "#3e3546", outdoor = "#64698d", fogcolor = "#574467"},
+    ["chroma key"] = {brightness = 2.69, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#1d671e", outdoor = "#31b034", fogcolor = "#00ff06"},
+    ["clear skies"] = {brightness = 1.79, exposure = 0.02, diffuse = 1, specular = 1, ambient = "#373c3f", outdoor = "#5a71aa", fogcolor = "#d0ebfd"},
+    ["cyan"] = {brightness = 1.82, exposure = 0.04, diffuse = 1, specular = 1, ambient = "#343e40", outdoor = "#61767a", fogcolor = "#3e5256"},
+    ["dead star forest"] = {brightness = 0.73, exposure = -0.5, diffuse = 1, specular = 1, ambient = "#211c23", outdoor = "#503842", fogcolor = "#1b151c"},
+    ["elegant morning"] = {brightness = 2.17, exposure = 0.21, diffuse = 1, specular = 1, ambient = "#454648", outdoor = "#7f8389", fogcolor = "#989aa2"},
+    ["emo"] = {brightness = 0.77, exposure = -0.49, diffuse = 1, specular = 1, ambient = "#1e1f22", outdoor = "#3d4048", fogcolor = "#16171b"},
+    ["fade blue"] = {brightness = 2.49, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#43505f", outdoor = "#788fad", fogcolor = "#8fc1f6"},
+    ["forest"] = {brightness = 2.05, exposure = 0.15, diffuse = 1, specular = 1, ambient = "#494236", outdoor = "#7e7d74", fogcolor = "#393124"},
+    ["galaxy"] = {brightness = 0.5, exposure = -0.62, diffuse = 1, specular = 1, ambient = "#1b0f5b", outdoor = "#432493", fogcolor = "#07031f"},
+    ["goodnight"] = {brightness = 0.96, exposure = -0.39, diffuse = 1, specular = 1, ambient = "#242141", outdoor = "#41448e", fogcolor = "#332d73"},
+    ["grimnight"] = {brightness = 0.8, exposure = -0.47, diffuse = 1, specular = 1, ambient = "#1e2020", outdoor = "#3c4248", fogcolor = "#0b0c0c"},
+    ["hades"] = {brightness = 0.61, exposure = -0.57, diffuse = 1, specular = 1, ambient = "#2e160d", outdoor = "#5d2e2c", fogcolor = "#9a3412"},
+    ["hazy"] = {brightness = 1.02, exposure = -0.36, diffuse = 1, specular = 1, ambient = "#30241b", outdoor = "#514a47", fogcolor = "#885835"},
+    ["jungle"] = {brightness = 1.87, exposure = 0.06, diffuse = 1, specular = 1, ambient = "#383f3b", outdoor = "#6b7678", fogcolor = "#415048"},
+    ["light blue"] = {brightness = 1.93, exposure = 0.09, diffuse = 1, specular = 1, ambient = "#324249", outdoor = "#5e7b92", fogcolor = "#71b3ce"},
+    ["light pink"] = {brightness = 1.53, exposure = -0.11, diffuse = 1, specular = 1, ambient = "#3d3040", outdoor = "#845879", fogcolor = "#be86cd"},
+    ["minecraft end"] = {brightness = 0.59, exposure = -0.58, diffuse = 1, specular = 1, ambient = "#331032", outdoor = "#6b2458", fogcolor = "#140313"},
+    ["minecraft"] = {brightness = 1.96, exposure = 0.11, diffuse = 1, specular = 1, ambient = "#40413b", outdoor = "#6a7a96", fogcolor = "#47493e"},
+    ["moonlight"] = {brightness = 0.9, exposure = -0.42, diffuse = 1, specular = 1, ambient = "#18252a", outdoor = "#304b53", fogcolor = "#254d5e"},
+    ["blue nebula"] = {brightness = 0.52, exposure = -0.61, diffuse = 1, specular = 1, ambient = "#101923", outdoor = "#23364b", fogcolor = "#060c12"},
+    ["gold nebula"] = {brightness = 0.63, exposure = -0.56, diffuse = 1, specular = 1, ambient = "#211a13", outdoor = "#463728", fogcolor = "#130d07"},
+    ["neon sky"] = {brightness = 1.25, exposure = -0.25, diffuse = 1, specular = 1, ambient = "#242c41", outdoor = "#4e5482", fogcolor = "#324779"},
+    ["neon sky 2"] = {brightness = 0.97, exposure = -0.39, diffuse = 1, specular = 1, ambient = "#351d41", outdoor = "#374988", fogcolor = "#4a1d60"},
+    ["night"] = {brightness = 0.83, exposure = -0.46, diffuse = 1, specular = 1, ambient = "#0f2431", outdoor = "#1f4968", fogcolor = "#06273c"},
+    ["night sky moon"] = {brightness = 0.71, exposure = -0.52, diffuse = 1, specular = 1, ambient = "#141e2c", outdoor = "#303f4d", fogcolor = "#020407"},
+    ["northern lights"] = {brightness = 0.98, exposure = -0.38, diffuse = 1, specular = 1, ambient = "#1c272a", outdoor = "#40449c", fogcolor = "#83dcf8"},
+    ["oblivion"] = {brightness = 1.1, exposure = -0.32, diffuse = 1, specular = 1, ambient = "#2d2819", outdoor = "#525044", fogcolor = "#7c682d"},
+    ["orange"] = {brightness = 1.56, exposure = -0.09, diffuse = 1, specular = 1, ambient = "#4b301c", outdoor = "#ac5539", fogcolor = "#c66920"},
+    ["overcast"] = {brightness = 2.54, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#4a5155", outdoor = "#838e94", fogcolor = "#8aa0aa"},
+    ["pandora"] = {brightness = 1.16, exposure = -0.29, diffuse = 1, specular = 1, ambient = "#1d2c38", outdoor = "#395393", fogcolor = "#4ea1e3"},
+    ["peaceful morning"] = {brightness = 2.23, exposure = 0.24, diffuse = 1, specular = 1, ambient = "#474748", outdoor = "#808594", fogcolor = "#c9cacc"},
+    ["pink sunrise"] = {brightness = 2.35, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#4e494f", outdoor = "#898a9b", fogcolor = "#b6a6b8"},
+    ["pumpkin hill"] = {brightness = 1.24, exposure = -0.25, diffuse = 1, specular = 1, ambient = "#41271c", outdoor = "#82485e", fogcolor = "#813e22"},
+    ["purple nebula"] = {brightness = 0.65, exposure = -0.55, diffuse = 1, specular = 1, ambient = "#26172a", outdoor = "#48325b", fogcolor = "#231027"},
+    ["red"] = {brightness = 0.63, exposure = -0.56, diffuse = 1, specular = 1, ambient = "#2b1712", outdoor = "#54322d", fogcolor = "#682a1b"},
+    ["setting sun"] = {brightness = 2.29, exposure = 0.27, diffuse = 1, specular = 1, ambient = "#5a453f", outdoor = "#98857d", fogcolor = "#c98874"},
+    ["sfoth"] = {brightness = 1.34, exposure = -0.2, diffuse = 1, specular = 1, ambient = "#402b20", outdoor = "#924e3e", fogcolor = "#d37844"},
+    ["shiverfrost"] = {brightness = 0.97, exposure = -0.39, diffuse = 1, specular = 1, ambient = "#21242e", outdoor = "#48494f", fogcolor = "#363d57"},
+    ["sky 05"] = {brightness = 1.17, exposure = -0.29, diffuse = 1, specular = 1, ambient = "#2a2a28", outdoor = "#485560", fogcolor = "#c7cbbe"},
+    ["sky 13"] = {brightness = 1.42, exposure = -0.16, diffuse = 1, specular = 1, ambient = "#322f40", outdoor = "#655a78", fogcolor = "#393552"},
+    ["sky 22"] = {brightness = 1.67, exposure = -0.04, diffuse = 1, specular = 1, ambient = "#48342c", outdoor = "#7a675a", fogcolor = "#8a553f"},
+    ["sky 31"] = {brightness = 1.46, exposure = -0.14, diffuse = 1, specular = 1, ambient = "#363040", outdoor = "#625e7c", fogcolor = "#7e679f"},
+    ["sky 38"] = {brightness = 1.31, exposure = -0.22, diffuse = 1, specular = 1, ambient = "#2a2e32", outdoor = "#4c5b6e", fogcolor = "#657483"},
+    ["sky 47"] = {brightness = 0.96, exposure = -0.39, diffuse = 1, specular = 1, ambient = "#2a231f", outdoor = "#4c4846", fogcolor = "#43332b"},
+    ["disaster"] = {brightness = 0.88, exposure = -0.43, diffuse = 1, specular = 1, ambient = "#401922", outdoor = "#693a46", fogcolor = "#8d233a"},
+    ["nibiru"] = {brightness = 1.18, exposure = -0.28, diffuse = 1, specular = 1, ambient = "#252a3b", outdoor = "#495371", fogcolor = "#5f73ba"},
+    ["sky purple"] = {brightness = 1.68, exposure = -0.03, diffuse = 1, specular = 1, ambient = "#4b28a0", outdoor = "#9258b6", fogcolor = "#2a0f69"},
+    ["sky sunset"] = {brightness = 1.56, exposure = -0.09, diffuse = 1, specular = 1, ambient = "#49302a", outdoor = "#745e80", fogcolor = "#7d4335"},
+    ["sky 2006"] = {brightness = 2.86, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#4d525b", outdoor = "#918b8e", fogcolor = "#b9cbec"},
+    ["space blue"] = {brightness = 0.73, exposure = -0.51, diffuse = 1, specular = 1, ambient = "#0e212a", outdoor = "#1c4557", fogcolor = "#062a3a"},
+    ["spooky"] = {brightness = 1.19, exposure = -0.28, diffuse = 1, specular = 1, ambient = "#1e2e33", outdoor = "#435b3b", fogcolor = "#081114"},
+    ["sunny sky"] = {brightness = 2.14, exposure = 0.2, diffuse = 1, specular = 1, ambient = "#444546", outdoor = "#7d8093", fogcolor = "#dde0e6"},
+    ["universe"] = {brightness = 1.0, exposure = -0.37, diffuse = 1, specular = 1, ambient = "#3f1e20", outdoor = "#574652", fogcolor = "#99353b"},
+    ["utter east"] = {brightness = 3.0, exposure = 0.3, diffuse = 1, specular = 1, ambient = "#5d4f47", outdoor = "#938b88", fogcolor = "#bf957d"},
+    ["whomp fortress"] = {brightness = 0.98, exposure = -0.38, diffuse = 1, specular = 1, ambient = "#1f2530", outdoor = "#363efa", fogcolor = "#83adff"},
+    ["winterness"] = {brightness = 1.82, exposure = 0.04, diffuse = 1, specular = 1, ambient = "#433b2e", outdoor = "#756d97", fogcolor = "#c0a069"},
+    ["xen"] = {brightness = 1.06, exposure = -0.34, diffuse = 1, specular = 1, ambient = "#1d2a2a", outdoor = "#3a5259", fogcolor = "#2a4c4e"},
+    ["zen end"] = {brightness = 0.88, exposure = -0.43, diffuse = 1, specular = 1, ambient = "#14261a", outdoor = "#2e4c43", fogcolor = "#1a522c"},
+}
+local COLOR3_FLOATS = 16
+
+local function lightingColor(v)
+    local hex = tostring(v):match("^#?(%x%x%x%x%x%x)$")
+    if hex then
+        return tonumber(hex:sub(1, 2), 16) / 255, tonumber(hex:sub(3, 4), 16) / 255, tonumber(hex:sub(5, 6), 16) / 255
+    end
+    local n = tonumber(v)
+    if n then return n, n, n end
+end
+
+local function applyLighting(conf, cache)
+    local values = {}
+    local name = conf.preset and tostring(conf.preset):lower()
+    if name == "match" then
+        if configSkybox.__refused then return 0, "the sky wasn't applied, so the lighting was left as it is" end
+        local sky = configSkybox.preset or configSkybox.skybox or configSkybox.name
+        name = sky and tostring(sky):lower()
+        if not (name and LIGHTING_PRESETS[name]) then return 0, "no lighting preset matches this skybox - left as it is" end
+    end
+    local preset = name and LIGHTING_PRESETS[name]
+    if conf.preset and not preset then return 0, "unknown lighting preset '" .. tostring(conf.preset) .. "'" end
+    for k, v in pairs(preset or {}) do values[k] = v end
+    for k in pairs(LIGHTING_FIELDS) do
+        if conf[k] then values[k] = conf[k] end
+    end
+    if not next(values) then return 0, nil end
+
+    local L = game:GetService("Lighting")
+    -- The Lighting fields sit at fixed offsets, so they are only written when
+    -- every one of them holds a value that looks like lighting (or equals the
+    -- property, where Matcha can read it); otherwise the offsets don't fit
+    -- this Roblox build and only the map profiles below are changed.
+    local RANGE = {Brightness = {0, 100}, ExposureCompensation = {-10, 10},
+        EnvironmentDiffuseScale = {0, 1.0001}, EnvironmentSpecularScale = {0, 1.0001}}
+    local function float(o)
+        local ok, v = pcall(mrd, "float", L.Address + o)
+        return ok and type(v) == "number" and v == v and v or nil
+    end
+    local fieldsFit = true
+    for _, field in pairs(LIGHTING_FIELDS) do
+        if field.off then
+            if field.color then
+                for i = 0, 2 do
+                    local v = float(field.off + i * 4)
+                    if not v or v < 0 or v > 1.0001 then fieldsFit = false end
+                end
+            else
+                local v, r = float(field.off), RANGE[field.key] or {-100, 100}
+                local okP, live = pcall(function() return L[field.key] end)
+                if not v or v < r[1] or v > r[2] or (okP and type(live) == "number" and math.abs(v - live) > 1e-3) then
+                    fieldsFit = false
+                end
+            end
+        end
+    end
+    local applied = 0
+    for name, raw in pairs(values) do
+        local field = LIGHTING_FIELDS[name]
+        if field and field.off and fieldsFit then
+            if field.color then
+                local r, g, b = lightingColor(raw)
+                if r then
+                    mwr("float", L.Address + field.off, r)
+                    mwr("float", L.Address + field.off + 4, g)
+                    mwr("float", L.Address + field.off + 8, b)
+                    applied = applied + 1
+                end
+            else
+                local n = tonumber(raw)
+                if n then
+                    mwr("float", L.Address + field.off, n)
+                    applied = applied + 1
+                end
+            end
+        end
+    end
+
+    local nodes = {}
+    for _, addr in ipairs(cache.lightNodes or {}) do
+        if nodeKey(addr) == "ExposureCompensation" and nodeKey(addr + NODE_SIZE) == "Brightness" then
+            nodes[#nodes + 1] = addr
+        end
+    end
+
+    if #nodes == 0 then
+        local lpFolders = {}
+        local ps = LP:FindFirstChild("PlayerScripts")
+        local folder = ps and ps:FindFirstChild("Modules") and ps.Modules:FindFirstChild("LightingProfiles")
+        if folder then
+            lpFolders[1] = folder
+        else
+            for _, d in ipairs(LP:GetDescendants()) do
+                if d.Name == "LightingProfiles" and d.Parent and d.Parent.Name == "Modules" then lpFolders[1] = d break end
+            end
+        end
+        for _, prof in ipairs(lpFolders[1] and lpFolders[1]:GetChildren() or {}) do
+            if prof.ClassName == "ModuleScript" then
+                local okT, t = pcall(moduleTable, prof)
+                local f = okT and t and nodesOf(t, 64, {LightingProperties = true})
+                local props = f and f.LightingProperties and rd(f.LightingProperties)
+                local pf = props and nodesOf(props, 64, {ExposureCompensation = true, Brightness = true})
+                if pf and pf.ExposureCompensation and pf.Brightness then nodes[#nodes + 1] = pf.ExposureCompensation end
+            end
+        end
+        if #nodes > 0 then cache.lightNodes = nodes end
+    end
+    if #nodes == 0 then
+        local okG, rows = pcall(getgc, {"ExposureCompensation"})
+        for _, r in ipairs(okG and type(rows) == "table" and rows or {}) do
+            if r.addr and nodeKey(r.addr) == "ExposureCompensation" and nodeKey(r.addr + NODE_SIZE) == "Brightness" then
+                nodes[#nodes + 1] = r.addr
+            end
+        end
+        cache.lightNodes = nodes
+    end
+
+    local profiles = 0
+    for _, exposureNode in ipairs(nodes) do
+
+        local wrote = false
+        for i = -12, 12 do
+            local node = exposureNode + i * NODE_SIZE
+            local key = nodeKey(node)
+            if key then
+                for name, field in pairs(LIGHTING_FIELDS) do
+                    if field.key == key and values[name] then
+                        if field.color then
+                            local ud = rd(node)
+                            local r, g, b = lightingColor(values[name])
+                            if ud and ud > 0x10000 and r then
+                                mwr("float", ud + COLOR3_FLOATS, r)
+                                mwr("float", ud + COLOR3_FLOATS + 4, g)
+                                mwr("float", ud + COLOR3_FLOATS + 8, b)
+                                wrote = true
+                            end
+                        else
+                            local n = tonumber(values[name])
+                            if n then
+                                mwr("double", node, n)
+                                wrote = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if wrote then profiles = profiles + 1 end
+    end
+    if not fieldsFit then
+        return 0, (profiles > 0)
+            and ("set on " .. profiles .. " lighting profiles, from the next map load (the Lighting offsets don't fit this Roblox build)")
+            or "left as it is: the Lighting offsets don't fit this Roblox build and no lighting profiles were found"
+    end
+    return applied, (profiles > 0) and ("kept across map changes on " .. profiles .. " lighting profiles")
+        or "applied to the current area only (lighting profiles not found)"
+end
+
+-- The sky preset's colours (fog, outdoor and ambient from its lighting
+-- preset), at full brightness and a little more vivid, most vivid first; nil
+-- when the sky has no lighting preset or wasn't applied. Color=sky (tracers)
+-- and Style=Sky (health bar) use them. A global: the main chunk is at Luau's
+-- local limit.
+_G.__RSC_SKY_COLORS = function()
+    if configSkybox.__refused then return nil end
+    local sky = configSkybox.preset or configSkybox.skybox or configSkybox.name
+    local p = sky and LIGHTING_PRESETS[tostring(sky):lower()]
+    if not p then return nil end
+    local out = {}
+    for _, k in ipairs({"fogcolor", "outdoor", "ambient"}) do
+        local r, g, b = lightingColor(p[k] or "")
+        if r then
+            local mx, mn = math.max(r, g, b), math.min(r, g, b)
+            local s = mx > 0 and (mx - mn) / mx or 0
+            local h = 0
+            if mx > mn then
+                if mx == r then h = ((g - b) / (mx - mn)) % 6
+                elseif mx == g then h = (b - r) / (mx - mn) + 2
+                else h = (r - g) / (mx - mn) + 4 end
+                h = h / 6
+            end
+            -- Greys stay grey; colours get at least some saturation.
+            local c = Color3.fromHSV(h, s < 0.06 and s or math.max(s, 0.5), 1)
+            out[#out + 1] = {c.R, c.G, c.B, s}
+        end
+    end
+    table.sort(out, function(a, b) return a[4] > b[4] end)
+    return #out > 0 and out or nil
+end
+
+local wrapPairs = readWrapPairs()
+if ENABLE_SKIN_DATA_SYNC and (#skinDataPairs > 0 or #wrapPairs > 0) then
+    print("[RivalsSkinChanger] Applying skin animations, offsets, icons" .. (#wrapPairs > 0 and " + wraps" or "") .. "...")
+    local tSync = tick()
+    local okS, synced, note, wrapsApplied, wrapsMissed, skinsMissed = pcall(syncSkinData, skinDataPairs, wrapPairs, dictCache)
+    local firstRoute = dictCache.route
+
+    dictCache.knownMissing = dictCache.knownMissing or {}
+    local function unexplained()
+        local n = 0
+        for _, name in ipairs(okS and skinsMissed or {}) do if not dictCache.knownMissing[name] then n = n + 1 end end
+        for _, name in ipairs(okS and wrapsMissed or {}) do if not dictCache.knownMissing[name] then n = n + 1 end end
+        return n
+    end
+    local function retry(label, forceScan)
+        print("[RivalsSkinChanger] " .. tostring((synced or 0)) .. "/" .. #skinDataPairs .. " skins, "
+            .. tostring(wrapsApplied or 0) .. "/" .. #wrapPairs .. " wraps - retrying with " .. label .. "...")
+        dictCache.vm, dictCache.cos, dictCache.vmBase, dictCache.cosBase = nil, nil, nil, nil
+        dictCache.forceScan = forceScan
+        local ok2, s2, n2, w2, wm2, sm2 = pcall(syncSkinData, skinDataPairs, wrapPairs, dictCache)
+        dictCache.forceScan = nil
+
+        if ok2 and ((s2 or 0) + (w2 or 0)) >= ((synced or 0) + (wrapsApplied or 0)) then
+            okS, synced, note, wrapsApplied, wrapsMissed, skinsMissed = ok2, s2, n2, w2, wm2, sm2
+        end
+    end
+    if okS and unexplained() > 0 then retry("a fresh lookup", false) end
+    if okS and unexplained() > 0 then
+        notifyUser("Rivals Skin Changer", "Some skins didn't load - double-checking with a full memory scan (~30s)...", 6)
+        retry("a full memory scan (~30s)", true)
+        if gameReady then
+            for _, name in ipairs(skinsMissed or {}) do dictCache.knownMissing[name] = true end
+            for _, name in ipairs(wrapsMissed or {}) do dictCache.knownMissing[name] = true end
+        end
+        local gone = {}
+        if skinsMissed and #skinsMissed > 0 then gone[#gone + 1] = "skins: " .. table.concat(skinsMissed, ", ") end
+        if wrapsMissed and #wrapsMissed > 0 then gone[#gone + 1] = "wraps: " .. table.concat(wrapsMissed, ", ") end
+        if #gone > 0 then
+            print("[RivalsSkinChanger] Not in the game's item list (check the names in your config) - " .. table.concat(gone, " | "))
+        end
+    end
+    if okS then
+        local parts = {}
+        if #skinDataPairs > 0 then parts[#parts + 1] = "Animations, offsets + icons applied: " .. tostring(synced) .. "/" .. #skinDataPairs end
+        if #wrapPairs > 0 then parts[#parts + 1] = "Wraps applied: " .. tostring(wrapsApplied or 0) .. "/" .. #wrapPairs end
+        local msg = table.concat(parts, " | ")
+        local wrapNote = (wrapsMissed and #wrapsMissed > 0) and (" (wraps not found: " .. table.concat(wrapsMissed, ", ") .. ")") or ""
+        print("[RivalsSkinChanger] " .. msg .. (note and (" (" .. note .. ")") or "") .. wrapNote .. string.format(" in %.1fs", tick() - tSync)
+            .. (firstRoute == "scan" and " (registry route failed - used the slow memory scan)" or ""))
+        notifyUser("Rivals Skin Changer", msg, 6)
+    else
+        print("[RivalsSkinChanger] Skin animation sync error: " .. tostring(synced))
+        notifyUser("Rivals Skin Changer", "Animation sync failed - skins are still swapped", 6)
+    end
+end
+local function applyPostEffects()
+    local okSky, patched, skyNote, skyRefused = pcall(applySkybox, configSkybox)
+    if okSky and (patched or 0) > 0 then
+        local msg = "Skybox set on " .. tostring(patched) .. " map profiles - it shows on the next map or area load"
+        print("[RivalsSkinChanger] " .. msg .. (skyNote and (" (" .. skyNote .. ")") or ""))
+        notifyUser("Rivals Skin Changer", msg, 6)
+        if skyRefused then notifyUser("Rivals Skin Changer", "Skybox: a sky here would crash the game - see the console", 8) end
+    elseif okSky and skyNote then
+        print("[RivalsSkinChanger] Skybox: " .. tostring(skyNote))
+        if skyRefused then notifyUser("Rivals Skin Changer", "Skybox: a sky here would crash the game - see the console", 8) end
+    elseif not okSky then
+        print("[RivalsSkinChanger] Skybox error: " .. tostring(patched))
+    end
+
+    local okS, changed, soundNote = pcall(applySounds, configSounds)
+    if okS and (changed or 0) > 0 then
+        print("[RivalsSkinChanger] Sounds: " .. tostring(changed) .. " replaced - heard from the next hit"
+            .. (soundNote and (" (" .. soundNote .. ")") or ""))
+    elseif okS and soundNote then
+        print("[RivalsSkinChanger] Sounds: " .. tostring(soundNote))
+    elseif not okS then
+        print("[RivalsSkinChanger] Sounds error: " .. tostring(changed))
+    end
+    local okV, watched = pcall(startVolumeWatcher, configSounds)
+    if okV and (watched or 0) > 0 then
+        print("[RivalsSkinChanger] Sound volume adjusted for " .. tostring(watched) .. " sound(s)")
+    elseif not okV then
+        print("[RivalsSkinChanger] Sound volume error: " .. tostring(watched))
+    end
+
+    local okP, spoofing, spoofNote = pcall(startSpoof, configSpoof)
+    if okP and spoofing then
+        print("[RivalsSkinChanger] Spoof on - only you see it" .. (spoofNote and (" (" .. spoofNote .. ")") or ""))
+    elseif not okP then
+        print("[RivalsSkinChanger] Spoof error: " .. tostring(spoofing))
+    end
+
+    local okL, applied, lightNote = pcall(applyLighting, configLighting, dictCache)
+    if okL and (applied or 0) > 0 then
+        print("[RivalsSkinChanger] Lighting: " .. tostring(applied) .. " settings" .. (lightNote and (" - " .. lightNote) or ""))
+    elseif okL and lightNote then
+        print("[RivalsSkinChanger] Lighting: " .. tostring(lightNote))
+    elseif not okL then
+        print("[RivalsSkinChanger] Lighting error: " .. tostring(applied))
+    end
+end
+applyPostEffects()
+
+-- Tracer colours
+-- Each shot's Beam.Color comes from a ColorSequence constant: TracerEffect's
+-- default, or the skin script's own (GetFriendlyTracerColor). Rewriting those
+-- constants recolours the tracers the game draws itself, so they don't lag.
+local function applyTracersEffect()
+    _G.__RIVALS_TRACERS = (_G.__RIVALS_TRACERS or 0) + 1
+    local token = _G.__RIVALS_TRACERS
+    if _G.__RIVALS_TRACER_CONN then pcall(function() _G.__RIVALS_TRACER_CONN:Disconnect() end) end
+    _G.__RIVALS_TRACER_CONN = nil
+
+    local job = game.JobId
+    local mods = psRoot and psRoot:FindFirstChild("Modules")
+    local function tracerModule() return mods and moduleTable(mods:FindFirstChild("TracerEffect")) end
+    local te = tracerModule()
+    -- Originals, kept across runs (same server only) so turning a colour off
+    -- puts the game's back.
+    local orig = _G.__RIVALS_TRACER_ORIG
+    if type(orig) ~= "table" or orig.te ~= te or orig.job ~= job then orig = {te = te, job = job, seqs = {}, checked = {}} end
+    _G.__RIVALS_TRACER_ORIG = orig
+
+    -- A two-keypoint ColorSequence: times 0 and 1, 0x14 apart.
+    local function isSeq(seq)
+        local ok0, t0 = pcall(mrd, "float", seq)
+        local ok1, t1 = pcall(mrd, "float", seq + 0x14)
+        return ok0 and ok1 and t0 == 0 and t1 == 1
+    end
+    local function writeSeq(seq, r, g, b)
+        if not isSeq(seq) then return false end
+        for _, k in ipairs({4, 0x18}) do
+            pcall(mwr, "float", seq + k, r)
+            pcall(mwr, "float", seq + k + 4, g)
+            pcall(mwr, "float", seq + k + 8, b)
+        end
+        return true
+    end
+    local function isNumber(a)
+        local ok, tt = pcall(mrd, "int", a + 12)
+        return ok and tt == 3
+    end
+    for seq, c in pairs(orig.seqs) do writeSeq(seq, c[1], c[2], c[3]) end
+    if orig.speed and isNumber(orig.speed[1]) then pcall(mwr, "double", orig.speed[1], orig.speed[2]) end
+
+    -- Speed: the per-shot function moves the tracer 800 / distance percent a
+    -- frame. That 800 sits in its constant list: Play's proto (closure +0x18),
+    -- its child protos (+0x28), the first one's constants (+0x48). Offsets for
+    -- Roblox build 02c37bc (Sep 30 2026).
+    local function speedSlot()
+        if orig.speed then return isNumber(orig.speed[1]) and orig.speed[1] or nil end
+        local f = nodesOf(te, 1024, {Play = true})
+        local cl = f and f.Play and rd(f.Play)
+        local proto = cl and cl > 0x10000 and rd(cl + 0x18)
+        local function constantsVia(protosOff, constOff, skip, exact)
+            local b = proto and proto > 0x10000 and (skip and rd(proto + skip) or proto)
+            local arr = b and b > 0x10000 and rd(b + protosOff)
+            local child = arr and arr > 0x10000 and rd(arr)
+            local d = child and child > 0x10000 and (skip and rd(child + skip) or child)
+            local k = d and d > 0x10000 and rd(d + constOff)
+            if not k or k < 0x10000 then return nil end
+            -- Only a list that holds the speed: 800 exactly, or (second pass)
+            -- an earlier run's value.
+            for i = 0, 63 do
+                local okV, v = pcall(mrd, "double", k + i * 16)
+                if okV and isNumber(k + i * 16) and (v == 800 or (not exact and v / 8 >= 5 and v / 8 <= 300 and (v / 8) % 5 == 0)) then return k end
+            end
+            return nil
+        end
+        -- Proto layouts: build 11f155f3, cec3ad5, 02c37bc, then the older one.
+        -- Every layout is tried for an exact 800 first, so a stray constant on
+        -- a wrong layout can't pass for an earlier run's speed.
+        local PATHS = {{0x18, 0x20}, {0x48, 0x20}, {0x28, 0x48}, {0x20, 0x38, 8}}
+        local k
+        for pass = 1, 2 do
+            for _, pth in ipairs(PATHS) do
+                k = k or constantsVia(pth[1], pth[2], pth[3], pass == 1)
+            end
+        end
+        if not k then return nil end
+        -- 800, or what an earlier run set it to (800 x a multiple of 5%)
+        local fallbackSlot
+        for i = 0, 63 do
+            local a = k + i * 16
+            local okV, v = pcall(mrd, "double", a)
+            if okV and isNumber(a) then
+                if v == 800 then
+                    orig.speed = {a, 800}
+                    return a
+                end
+                local pct = v / 8
+                if not fallbackSlot and pct >= 5 and pct <= 300 and pct % 5 == 0 then fallbackSlot = a end
+            end
+        end
+        if fallbackSlot then orig.speed = {fallbackSlot, 800} end
+        return fallbackSlot
+    end
+
+    local function seqOf(t, key)
+        local f = nodesOf(t, 1024, {[key] = true})
+        local cl = f and f[key] and rd(f[key])
+        local p1 = cl and cl > 0x10000 and rd(cl + 0x20)
+        local seq = p1 and p1 > 0x10000 and rd(p1 + 0x10)
+        if seq and seq > 0x10000 and isSeq(seq) then return seq end
+    end
+    -- Skin scripts load when first used, so this runs again on every equip.
+    -- A loaded script is only read once; the rest is a few reads each.
+    local function collect()
+        local list = {}
+        local function add(seq)
+            if not seq then return end
+            if not orig.seqs[seq] then
+                orig.seqs[seq] = {mrd("float", seq + 4), mrd("float", seq + 8), mrd("float", seq + 12)}
+            end
+            list[#list + 1] = seq
+        end
+        add(seqOf(te, "VerifyTracerData"))
+        -- The live folder: after a switch-mode folder trade the path leads to the clean copy.
+        local vms = _G.__RSC_VMS_LIVE or mods:FindFirstChild("ViewModels")
+        for _, d in ipairs(vms and vms:GetDescendants() or {}) do
+            if d.ClassName == "ModuleScript" then
+                local a = d.Address
+                if orig.checked[a] == nil then
+                    local t = moduleTable(d)
+                    if t then orig.checked[a] = seqOf(t, "GetFriendlyTracerColor") or false end
+                end
+                add(orig.checked[a] or nil)
+            end
+        end
+        return list
+    end
+
+    local conf = {}
+    for k, v in pairs(configTracers) do conf[k:lower()] = tostring(v):lower() end
+
+    local speed = tonumber(conf.speed)
+    if speed and te then
+        speed = math.max(5, math.min(300, speed))
+        local slot = speedSlot()
+        if slot then
+            pcall(mwr, "double", slot, 800 * speed / 100)
+            print("[RivalsSkinChanger] Tracers: speed " .. speed .. "%")
+        else
+            print("[RivalsSkinChanger] Tracers: couldn't find the tracer speed - left as it is")
+        end
+    end
+    conf.speed = nil
+
+    -- Energy Pistols ship with DisableTracerEffects = true, so the game draws
+    -- no tracers for them. EnergyPistolsTracers=true flips it off (the gun then
+    -- takes the colours and speed above like the others); without the line
+    -- the game's value is put back. Only the local tracer drawing reads it.
+    -- (A function of its own: the main chunk is at Luau's 200-local limit.)
+    pcall(function()
+        local on = spoofFlag(conf.energypistolstracers) == true
+        local rsMods = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+        local lib = moduleTable(rsMods and rsMods:FindFirstChild("ItemLibrary"))
+        local f = nodesOf(lib, 256, {Items = true})
+        local items = f and f.Items and rd(f.Items)
+        local fi = items and nodesOf(items, 256, {["Energy Pistols"] = true})
+        local ep = fi and fi["Energy Pistols"] and rd(fi["Energy Pistols"])
+        local fe = ep and nodesOf(ep, 256, {DisableTracerEffects = true})
+        local node = fe and fe.DisableTracerEffects
+        local okT, tt = pcall(mrd, "int", (node or 0) + 12)
+        if node and okT and tt == 1 then
+            local want = on and 0 or 1
+            local okV, now = pcall(mrd, "int", node)
+            if okV and now ~= want then pcall(mwr, "int", node, want) end
+            if on then print("[RivalsSkinChanger] Tracers: Energy Pistols now draw tracers") end
+        elseif on then
+            print("[RivalsSkinChanger] Tracers: couldn't find the Energy Pistols tracer setting - left as it is")
+        end
+    end)
+    conf.energypistolstracers = nil
+    local fallback = conf.color or conf.all or conf.default
+    local any = next(conf) ~= nil
+
+    if any and te then
+        local seqs, current, lastName = collect(), nil, false
+        local acc, sinceCheck, lastRgb = 0, 0, nil
+        local function equipped()
+            local vmf = workspace:FindFirstChild("ViewModels")
+            local fp = vmf and vmf:FindFirstChild("FirstPerson")
+            local c = fp and fp:GetChildren()[1]
+            return c and c.Name
+        end
+        local function pick(name)
+            local parts = {}
+            for p in tostring(name or ""):gmatch("[^%-]+") do parts[#parts + 1] = p:match("^%s*(.-)%s*$"):lower() end
+            return (parts[3] and conf[parts[3]]) or (parts[2] and conf[parts[2]]) or fallback
+        end
+        -- Color=sky: the sky preset's most vivid colour.
+        local skyCols = _G.__RSC_SKY_COLORS and _G.__RSC_SKY_COLORS()
+        -- Color=wrap: the most vivid colour on the weapon in your hands (its
+        -- wrap's, or the skin's own without one), read again every second
+        -- as the game paints the wrap on just after you equip it.
+        local function weaponColor()
+            local vmf = workspace:FindFirstChild("ViewModels")
+            local fp = vmf and vmf:FindFirstChild("FirstPerson")
+            local m = fp and fp:GetChildren()[1]
+            if not m then return nil end
+            local best, bestScore, bright, brightV, seen = nil, 0, nil, -1, {}
+            for _, d in ipairs(m:GetDescendants()) do
+                local cn = d.ClassName
+                if (cn == "MeshPart" or cn == "Part" or cn == "UnionOperation") and not d.Name:find("Arm") then
+                    local okC, c = pcall(function() return d.Color end)
+                    if okC and c then
+                        local r, g, b = c.R, c.G, c.B
+                        if r > 1 or g > 1 or b > 1 then r, g, b = r / 255, g / 255, b / 255 end
+                        local key = math.floor(r * 255) .. "," .. math.floor(g * 255) .. "," .. math.floor(b * 255)
+                        seen[key] = (seen[key] or 0) + 1
+                        local mx, mn = math.max(r, g, b), math.min(r, g, b)
+                        local score = (mx > 0 and (mx - mn) / mx or 0) * mx * math.sqrt(seen[key])
+                        if score > bestScore then best, bestScore = {r, g, b}, score end
+                        if mx > brightV then bright, brightV = {r, g, b}, mx end
+                    end
+                end
+            end
+            -- An all-grey weapon gives its brightest grey.
+            return (bestScore > 0.08 and best) or bright
+        end
+        local wrapCol
+        local conn
+        conn = game:GetService("RunService").Heartbeat:Connect(function(dt)
+            if _G.__RIVALS_TRACERS ~= token then pcall(function() conn:Disconnect() end) return end
+            dt = dt or 1 / 60
+            acc, sinceCheck = acc + dt, sinceCheck + dt
+            if acc < 0.05 then return end
+            acc = 0
+            if sinceCheck >= 1 then
+                sinceCheck, lastRgb = 0, nil -- rewrite once a second in case the game reset one
+                if current == "wrap" then wrapCol = weaponColor() end
+                if game.JobId ~= job or tracerModule() ~= te then
+                    pcall(function() conn:Disconnect() end)
+                    return
+                end
+            end
+            local name = equipped()
+            if name ~= lastName then
+                lastName, lastRgb = name, nil
+                seqs = collect()
+                current = pick(name)
+                wrapCol = current == "wrap" and weaponColor() or nil
+            end
+            local r, g, b
+            if current == "rainbow" then
+                local c = Color3.fromHSV(tick() * 0.25 % 1, 1, 1)
+                r, g, b = c.R, c.G, c.B
+            elseif current == "sky" then
+                if skyCols then r, g, b = skyCols[1][1], skyCols[1][2], skyCols[1][3] end
+            elseif current == "wrap" then
+                if wrapCol then r, g, b = wrapCol[1], wrapCol[2], wrapCol[3] end
+            elseif current and current ~= "off" and current ~= "default" then
+                r, g, b = lightingColor(current)
+            end
+            local rgb = r and (r .. "," .. g .. "," .. b) or "orig"
+            if rgb == lastRgb then return end
+            lastRgb = rgb
+            for _, seq in ipairs(seqs) do
+                local c = r and {r, g, b} or orig.seqs[seq]
+                if c then writeSeq(seq, c[1], c[2], c[3]) end
+            end
+        end)
+        _G.__RIVALS_TRACER_CONN = conn
+        print("[RivalsSkinChanger] Tracers: recolouring " .. #seqs .. " tracer colours (more load as you equip skins)")
+        local wantsSky = false
+        for _, v in pairs(conf) do if v == "sky" then wantsSky = true end end
+        if wantsSky and not skyCols then
+            print("[RivalsSkinChanger] Tracers: Color=sky needs a sky preset with matching lighting - those tracers keep the game's colour")
+        end
+    elseif any then
+        print("[RivalsSkinChanger] Tracers: TracerEffect not loaded yet - fire once and run again")
+    end
+end
+applyTracersEffect()
+
+-- No hands
+-- Your first-person arms are two parts with a SpecialMesh each; the game hides
+-- them for VR by setting the mesh's Scale to zero. The same is done here for
+-- the weapons in [NoHands]: the scale is written in memory, then the part's
+-- Size is changed (a real property change) so the arm is drawn again with it.
+-- Arms are handled as their weapon comes out, and put back the same way.
+local function applyNoHandsEffect()
+    _G.__RIVALS_NOHANDS = (_G.__RIVALS_NOHANDS or 0) + 1
+    local token = _G.__RIVALS_NOHANDS
+    if _G.__RIVALS_NOHANDS_CONN then pcall(function() _G.__RIVALS_NOHANDS_CONN:Disconnect() end) end
+    _G.__RIVALS_NOHANDS_CONN = nil
+
+    local MESH_SCALE = dumpOff("SpecialMesh", "Scale", 0xB4) -- SpecialMesh.Scale, three floats
+    local ARM_SIZE, TINY = Vector3.new(1.8, 0.45, 0.45), Vector3.new(0.001, 0.001, 0.001)
+    local job = game.JobId
+    -- What was hidden, kept across runs (same server) so it can be put back:
+    -- mesh address -> its scale.
+    local hidden = _G.__RIVALS_NOHANDS_HIDDEN
+    if type(hidden) ~= "table" or hidden.job ~= job then hidden = {job = job, scales = {}, any = false} end
+    _G.__RIVALS_NOHANDS_HIDDEN = hidden
+
+    local conf = {}
+    for k, v in pairs(configNoHands) do conf[k:lower()] = spoofFlag(v) end
+    local function wanted(name)
+        local parts = {}
+        for part in tostring(name or ""):gmatch("[^%-]+") do parts[#parts + 1] = part:match("^%s*(.-)%s*$"):lower() end
+        local v = parts[3] and conf[parts[3]]
+        if v == nil then v = parts[2] and conf[parts[2]] end
+        if v == nil then v = conf.all end
+        return v == true
+    end
+
+    local function scaleOf(mesh)
+        local a = mesh.Address
+        local ok, x = pcall(mrd, "float", a + MESH_SCALE)
+        local ok2, y = pcall(mrd, "float", a + MESH_SCALE + 4)
+        local ok3, z = pcall(mrd, "float", a + MESH_SCALE + 8)
+        if ok and ok2 and ok3 and x and y and z then return x, y, z end
+    end
+    local function setScale(mesh, x, y, z)
+        local a = mesh.Address
+        pcall(mwr, "float", a + MESH_SCALE, x)
+        pcall(mwr, "float", a + MESH_SCALE + 4, y)
+        pcall(mwr, "float", a + MESH_SCALE + 8, z)
+    end
+    local function pass()
+        local vmf = workspace:FindFirstChild("ViewModels")
+        local fp = vmf and vmf:FindFirstChild("FirstPerson")
+        for _, vm in ipairs(fp and fp:GetChildren() or {}) do
+            local hide = wanted(vm.Name)
+            for _, armName in ipairs({"LeftArm", "RightArm"}) do
+                local arm = vm:FindFirstChild(armName)
+                local mesh = arm and arm:FindFirstChild("Mesh")
+                if mesh and mesh.ClassName == "SpecialMesh" then
+                    local x, y, z = scaleOf(mesh)
+                    local key = mesh.Address
+                    if hide and x and (x ~= 0 or y ~= 0 or z ~= 0) then
+                        -- a sane scale only: anything else isn't the field it was
+                        if x > 0 and x < 20 and y > 0 and y < 20 and z > 0 and z < 20 then
+                            hidden.scales[key], hidden.any = {x, y, z}, true
+                            setScale(mesh, 0, 0, 0)
+                            pcall(function() arm.Size = TINY end)
+                        end
+                    elseif not hide and x == 0 and y == 0 and z == 0 and hidden.scales[key] then
+                        local sc = hidden.scales[key]
+                        hidden.scales[key] = nil
+                        setScale(mesh, sc[1], sc[2], sc[3])
+                        pcall(function() arm.Size = ARM_SIZE end)
+                    end
+                end
+                -- The wrapped arm (shown instead when a wrap covers the arms) is a
+                -- MeshPart, which follows its Size.
+                local wrapped = vm:FindFirstChild(armName .. "Wrapped")
+                if wrapped and wrapped.ClassName == "MeshPart" then
+                    local okS, size = pcall(function() return wrapped.Size end)
+                    if okS and size then
+                        if hide and size.X > 0.01 then
+                            hidden.any = true
+                            pcall(function() wrapped.Size = TINY end)
+                        elseif not hide and size.X <= 0.01 then
+                            pcall(function() wrapped.Size = ARM_SIZE end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local any = false
+    for _, v in pairs(conf) do if v == true then any = true end end
+    -- Also runs with nothing set while arms hidden earlier are still out there,
+    -- so they come back as their weapons are equipped.
+    if any or hidden.any then
+        local acc, conn = 0, nil
+        conn = game:GetService("RunService").Heartbeat:Connect(function(dt)
+            if _G.__RIVALS_NOHANDS ~= token or game.JobId ~= job then pcall(function() conn:Disconnect() end) return end
+            acc = acc + (dt or 1 / 60)
+            if acc < 0.15 then return end
+            acc = 0
+            pcall(pass)
+        end)
+        _G.__RIVALS_NOHANDS_CONN = conn
+        pcall(pass)
+        if any then
+            local names = {}
+            for k, v in pairs(conf) do if v == true then names[#names + 1] = k == "all" and "every weapon" or k end end
+            table.sort(names)
+            print("[RivalsSkinChanger] No hands: " .. table.concat(names, ", ") .. " - only you see it")
+        end
+    end
+end
+applyNoHandsEffect()
+
+-- Finishers and charms
+-- Season rank charms
+local function showOnlyVariant(model, keepName)
+    local extra = model:FindFirstChild("Extra")
+    local keep = extra and extra:FindFirstChild(keepName)
+    if not keep then return false end
+    for _, v in ipairs(extra:GetChildren()) do
+        if v.Address ~= keep.Address then
+            local parts = v:GetDescendants()
+            parts[#parts + 1] = v
+            for _, d in ipairs(parts) do
+                local c = d.ClassName
+                if c == "Part" or c == "MeshPart" or c == "UnionOperation" then
+                    local addr = d.Address + OFF.Transparency
+                    local okR, old = pcall(mrd, "float", addr)
+                    if okR and old then
+                        floatRestores[#floatRestores + 1] = {addr, old}
+                        pcall(mwr, "float", addr, 1)
+                    end
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function applyCosmetics()
+    if #configFinishers == 0 and #configCharms == 0 then return nil end
+    local modules = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+    local finishers = modules and modules:FindFirstChild("Finishers")
+    local charmModels = A and A:FindFirstChild("Charms")
+    local psModules = psRoot and psRoot:FindFirstChild("Modules")
+    local charmScripts = psModules and psModules:FindFirstChild("Charms")
+    local used, done, missed, dupes = {}, {}, {}, {}
+    -- A swap trades two models, so each one can only be in one line.
+    local function claim(kind, a, b)
+        local by = used[kind .. a] or used[kind .. b]
+        if by then
+            dupes[#dupes + 1] = a .. " -> " .. b .. " (" .. by .. " already uses it)"
+            return false
+        end
+        used[kind .. a], used[kind .. b] = a .. " -> " .. b, a .. " -> " .. b
+        return true
+    end
+    for _, p in ipairs(configFinishers) do
+        local owned, target = p[1], p[2]
+        local a, b
+        for _ = 1, 20 do
+            a = finishers and finishers:FindFirstChild(owned)
+            b = finishers and finishers:FindFirstChild(target)
+            if a and b then break end
+            task.wait(0.5)
+        end
+        if not a or not b then
+            missed[#missed + 1] = owned .. "=" .. target .. " (" .. (not a and owned or target) .. " isn't a finisher)"
+        elseif not claim("f:", owned, target) then
+            missed[#missed + 1] = owned .. "=" .. target .. " (already used by another line)"
+        elseif swapTwoWay(a, b, finishers) then
+            done[#done + 1] = owned .. " -> " .. target
+        else
+            missed[#missed + 1] = owned .. "=" .. target .. " (swap failed)"
+        end
+    end
+    for _, p in ipairs(configCharms) do
+        local owned, target = p[1], p[2]
+        -- Charm models (the unreleased seasons especially) can still be
+        -- streaming in when autoexec starts the script: look again for up to 10s.
+        local a, b, variant
+        for _ = 1, 20 do
+            a = charmModels and charmModels:FindFirstChild(owned)
+            b, variant = charmModels and charmModels:FindFirstChild(target), nil
+            if not b and charmModels then
+                local base, rank = target:match("^(Season %d+)%s+(.+)$")
+                local m = base and charmModels:FindFirstChild(base)
+                local extra = m and m:FindFirstChild("Extra")
+                if extra and extra:FindFirstChild(rank) then b, variant = m, rank end
+            end
+            if a and b then break end
+            task.wait(0.5)
+        end
+        if not a or not b then
+            missed[#missed + 1] = owned .. "=" .. target .. " (" .. (not a and owned or target) .. " isn't a charm)"
+        elseif not claim("c:", owned, variant and b.Name or target) then
+            missed[#missed + 1] = owned .. "=" .. target .. " (already used by another line)"
+        elseif swapTwoWay(a, b, charmModels) then
+            if variant then showOnlyVariant(b, variant) end
+            local oa = charmScripts and charmScripts:FindFirstChild(owned)
+            local ob = charmScripts and charmScripts:FindFirstChild(target)
+            if oa and ob then
+                swapTwoWay(oa, ob, charmScripts)
+            elseif ob then
+                copyName(ob, b)
+            elseif oa then
+                copyName(oa, a)
+            end
+            done[#done + 1] = owned .. " -> " .. target
+        else
+            missed[#missed + 1] = owned .. "=" .. target .. " (swap failed)"
+        end
+    end
+    return done, missed, dupes
+end
+
+do
+    local okC, done, missed, dupes = pcall(applyCosmetics)
+    if not okC then
+        print("[RivalsSkinChanger] Finishers/charms error: " .. tostring(done))
+    elseif done then
+        if #done > 0 then
+            local msg = "Finishers/charms: " .. table.concat(done, ", ")
+            print("[RivalsSkinChanger] " .. msg .. " - finishers show from their next use, charms on the next equip")
+            notifyUser("Rivals Skin Changer", msg, 6)
+        end
+        if #missed > 0 then
+            print("[RivalsSkinChanger] Finishers/charms not applied: " .. table.concat(missed, "; "))
+        end
+        if dupes and #dupes > 0 then
+            notifyUser("Rivals Skin Changer", "Skipped - two lines use the same finisher or charm: "
+                .. table.concat(dupes, ", "), 10)
+        end
+    end
+end
+
+-- Health bar: your own bar in the bottom HUD, only you see it. The game sets
+-- its colours on every health change and the UI redraws from memory every
+-- frame, so a style writes them every frame.
+-- Gradient: Matcha can't make a UIGradient, but a frame draws the one its
+-- gradient slot points to, so the bar borrows the 11-stop gradient of the
+-- Hardcore Parkour progress bar (its reference count raised, so neither
+-- frame frees it). Its stops are then recoloured every frame. While it's
+-- linked, that mode's progress bar shows the same colours.
+pcall(function()
+    local conf = {}
+    for k, v in pairs(_G.__RSC_HPBAR_CFG or {}) do conf[k] = tostring(v) end
+    local style = (conf.style or ""):lower()
+    if style == "cycle" then style = "gradient" end
+    if not ({color = true, rainbow = true, gradient = true, health = true, sky = true})[style] then style = "default" end
+    _G.__RSC_HPBAR = (_G.__RSC_HPBAR or 0) + 1
+    local token, job = _G.__RSC_HPBAR, game.JobId
+    local O = {col = OFF.GuiColor, size = OFF.GuiSize, vis = OFF.GuiVisible}
+
+    local function rgbOf(v, fallback)
+        local r, g, b = lightingColor(v or "")
+        if r then return {r, g, b} end
+        return fallback
+    end
+    local GAME = {{1, 50 / 255, 50 / 255}, {1, 215 / 255, 0}, {100 / 255, 1, 50 / 255}}
+    local function mix(a, b, t) return {a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t} end
+    -- The game's own colour for a health fraction: low -> mid -> full.
+    local function byHealth(low, mid, full, a) return mix(low, mix(mid, full, a), a) end
+    local fixed = rgbOf(conf.color, {0.6, 0.2, 1})
+    local low, mid, full = rgbOf(conf.low, GAME[1]), rgbOf(conf.mid, GAME[2]), rgbOf(conf.full, GAME[3])
+    -- Gradient: Color1 -> Color2 along the bar, scrolling at Speed (0 holds
+    -- it still); Color1=Rainbow scrolls the whole spectrum.
+    local rainbowGrad = (conf.color1 or ""):lower() == "rainbow"
+    local g1, g2 = rgbOf(conf.color1, {1, 43 / 255, 214 / 255}), rgbOf(conf.color2, {59 / 255, 91 / 255, 1})
+    local speed = math.max(0, math.min(500, tonumber(conf.speed) or 100)) / 100
+    local function gradColor(t)
+        if rainbowGrad then
+            local c = Color3.fromHSV(t % 1, 0.85, 1)
+            return {c.R, c.G, c.B}
+        end
+        return mix(g1, g2, 0.5 - 0.5 * math.cos(2 * math.pi * t))
+    end
+    -- Sky: a gradient in the sky preset's colours, its two most vivid ones
+    -- (or one and a darker shade of it when they're alike).
+    if style == "sky" then
+        local cols = _G.__RSC_SKY_COLORS and _G.__RSC_SKY_COLORS()
+        if cols then
+            local a = cols[1]
+            local b
+            for i = 2, #cols do
+                local c = cols[i]
+                if math.abs(c[1] - a[1]) + math.abs(c[2] - a[2]) + math.abs(c[3] - a[3]) > 0.3 then b = c break end
+            end
+            b = b or {a[1] * 0.4, a[2] * 0.4, a[3] * 0.4}
+            g1, g2, rainbowGrad = {a[1], a[2], a[3]}, {b[1], b[2], b[3]}, false
+            style, conf.label = "gradient", "sky colours"
+        else
+            print("[RivalsSkinChanger] Health bar: Style=Sky needs a sky preset with matching lighting - left the game's bar")
+            style = "default"
+        end
+    end
+
+    -- Finds the bar: FighterInterfaces.<you>.<Bottom side>.Container.Health,
+    -- moved between sides by the game's "Health Bar Display" setting.
+    local function find()
+        local lp = game:GetService("Players").LocalPlayer
+        local pg = lp and lp:FindFirstChild("PlayerGui")
+        local sg = pg and pg:FindFirstChild("MainGui")
+        local mf = sg and sg:FindFirstChild("MainFrame")
+        local fi = mf and mf:FindFirstChild("FighterInterfaces")
+        if not fi then return nil end
+        local list = fi:GetChildren()
+        table.sort(list, function(a, b) return a.Name == lp.Name and b.Name ~= lp.Name end)
+        for _, c in ipairs(list) do
+            for _, side in ipairs({"BottomLeft", "BottomCenter", "BottomRight"}) do
+                local s = c:FindFirstChild(side)
+                local box = s and s:FindFirstChild("Container")
+                local h = box and box:FindFirstChild("Health")
+                local cont = h and h:FindFirstChild("Container")
+                local b = cont and cont:FindFirstChild("Bar")
+                local bg = cont and cont:FindFirstChild("Background")
+                if b and bg then
+                    return {bar = b.Address, corner = b:FindFirstChild("UICorner"),
+                        frames = {{b.Address, 1}, {cont.Address, 0.5}, {bg.Address, 1 / 3}}}
+                end
+            end
+        end
+    end
+    -- Checks the colour offset on the bar (BorderColor3 right after it is
+    -- Roblox's default 27,42,53); otherwise looks for it nearby.
+    local function checkOffsets(b)
+        local function border(at)
+            local r, g, bl = mrd("float", b + at), mrd("float", b + at + 4), mrd("float", b + at + 8)
+            return r and math.abs(r - 27 / 255) < 0.002 and math.abs(g - 42 / 255) < 0.002 and math.abs(bl - 53 / 255) < 0.002
+        end
+        if border(O.col + 0xC) then return true end
+        for at = 0x400, 0x800, 4 do
+            if border(at) then
+                local d = at - 0xC - O.col
+                O.col, O.size, O.vis = O.col + d, O.size + d, O.vis + d
+                return true
+            end
+        end
+        return false
+    end
+
+    local function fraction(bar)
+        if mrd("byte", bar.bar + O.vis) == 0 then return 0 end
+        local s = mrd("float", bar.bar + O.size)
+        return s and math.max(0, math.min(1, s)) or 1
+    end
+    local function paint(bar, c)
+        for _, f in ipairs(bar.frames) do
+            for i = 0, 2 do mwr("float", f[1] + O.col + i * 4, c[i + 1] * f[2]) end
+        end
+    end
+
+    -- Gradient slots. A frame keeps its UICorner at one slot (found by its
+    -- address) and its UIGradient 0x30 before it, a flag 8 before.
+    -- A UIGradient keeps its transparency stops at +0xb8 (count +0xc0, 12
+    -- bytes each) and colour stops at +0xf8 (count +0x100, 20 bytes each:
+    -- time, r, g, b, envelope).
+    local function slotsOf(bar)
+        if not bar.corner then return nil end
+        local ca = bar.corner.Address
+        for off = 0x600, 0xC00, 8 do
+            if rd(bar.bar + off) == ca then return off - 0x30, off - 8 end
+        end
+    end
+    local function stops(g)
+        local p, n = rd(g + 0xf8), mrd("int", g + 0x100)
+        if not p or p < 0x10000 or not n or n < 2 or n > 64 then return nil end
+        local t0, t1 = mrd("float", p), mrd("float", p + (n - 1) * 20)
+        if t0 ~= 0 or t1 ~= 1 then return nil end
+        return p, n
+    end
+    -- The duel UI's 11-stop gradient, or (right after joining, before that
+    -- UI exists) the 7-stop hue bar in the settings template under
+    -- PlayerScripts, which is always there.
+    local function donor()
+        local lp = game:GetService("Players").LocalPlayer
+        local pg = lp:FindFirstChild("PlayerGui")
+        local mf = pg and pg:FindFirstChild("MainGui")
+        mf = mf and mf:FindFirstChild("MainFrame")
+        local ps = lp:FindFirstChild("PlayerScripts")
+        local ui = ps and ps:FindFirstChild("UserInterface")
+        for _, root in ipairs({mf and mf:FindFirstChild("DuelInterfaces"), ui and ui:FindFirstChild("SettingFrame")}) do
+            local best, bestN
+            for _, d in ipairs(root and root:GetDescendants() or {}) do
+                if d.ClassName == "UIGradient" and d.Parent and d.Parent.ClassName ~= "UIStroke" then
+                    local _, n = stops(d.Address)
+                    if n and n >= 5 and (not bestN or n > bestN) then best, bestN = d.Address, n end
+                end
+            end
+            if best then return best end
+        end
+    end
+    -- Links a gradient into the bar (or finds the one an earlier run linked).
+    local function link(bar)
+        local slot, flag = slotsOf(bar)
+        if not slot then return nil end
+        local g = rd(bar.bar + slot)
+        if not (g and g > 0x10000 and stops(g)) then
+            g = donor()
+            if not g then return nil end
+            local ctrl = rd(g + 0x10)
+            local uses = ctrl and ctrl > 0x10000 and mrd("int", ctrl + 8)
+            if not uses or uses < 1 or uses > 1000 then return nil end
+            mwr("int", ctrl + 8, uses + 1)
+            wr(bar.bar + slot + 8, ctrl)
+            wr(bar.bar + slot, g)
+            mwr("byte", bar.bar + flag, 1)
+        end
+        -- Opaque all along.
+        local tp, tn = rd(g + 0xb8), mrd("int", g + 0xc0)
+        if tp and tp > 0x10000 and tn and tn > 0 and tn < 64 then
+            for i = 0, tn - 1 do mwr("float", tp + i * 12 + 4, 0) end
+        end
+        return {g = g, slot = slot, flag = flag}
+    end
+    -- Turning the gradient off leaves it linked (removing it while Roblox
+    -- may still be drawing it crashed the game once) and makes every stop
+    -- white and opaque, which draws the bar exactly as the game would. A
+    -- rejoin starts without it.
+    local function unlink(bar)
+        local slot = slotsOf(bar)
+        if not slot then return end
+        local g = rd(bar.bar + slot)
+        if not g or g < 0x10000 then return end
+        local p, n = stops(g)
+        for i = 0, (n or 0) - 1 do
+            for j = 1, 3 do mwr("float", p + i * 20 + j * 4, 1) end
+        end
+        local tp, tn = rd(g + 0xb8), mrd("int", g + 0xc0)
+        if tp and tp > 0x10000 and tn and tn > 0 and tn < 64 then
+            for i = 0, tn - 1 do mwr("float", tp + i * 12 + 4, 0) end
+        end
+    end
+
+    local bar = find()
+    if bar and not checkOffsets(bar.bar) then
+        print("[RivalsSkinChanger] Health bar: couldn't find its colour in memory on this Roblox build - left as it is")
+        return
+    end
+    -- Puts the game's look back: its colour for the current health, no gradient.
+    local function restore()
+        if bar then
+            pcall(unlink, bar)
+            pcall(paint, bar, byHealth(GAME[1], GAME[2], GAME[3], fraction(bar)))
+        end
+    end
+    if style == "default" then
+        restore()
+        return
+    end
+    if style ~= "gradient" and bar then pcall(unlink, bar) end
+
+    local grad
+    if style == "gradient" and bar then
+        local okL, l = pcall(link, bar)
+        grad = okL and l or nil
+        if not grad then
+            print("[RivalsSkinChanger] Health bar: couldn't link a gradient on this Roblox build - using Color1 instead")
+            style, fixed = "color", g1
+        end
+    end
+
+    -- The frames written every frame are held (see __RSC_HOLD), so a bar
+    -- the game rebuilds on respawn is never written after it's freed.
+    local function holdBar(b)
+        b.holds = {}
+        for _, f in ipairs(b.frames) do
+            local c = _G.__RSC_HOLD(f[1])
+            if not c then
+                for _, h in ipairs(b.holds) do _G.__RSC_RELEASE(h) end
+                b.holds = nil
+                return false
+            end
+            b.holds[#b.holds + 1] = c
+        end
+        return true
+    end
+    local function releaseBar(b)
+        for _, h in ipairs(b and b.holds or {}) do _G.__RSC_RELEASE(h) end
+        if b then b.holds = nil end
+    end
+    if bar and not holdBar(bar) then bar = nil end
+
+    local acc = 0
+    local conn
+    conn = game:GetService("RunService").Heartbeat:Connect(function(dt)
+        if _G.__RSC_HPBAR ~= token or game.JobId ~= job then
+            pcall(function() conn:Disconnect() end)
+            if game.JobId == job then releaseBar(bar) end
+            return
+        end
+        acc = acc + (dt or 1 / 60)
+        -- Looks for the bar again now and then: it moves with the setting and
+        -- is rebuilt on respawn.
+        if acc > 1 then
+            acc = 0
+            local okF, b = pcall(find)
+            if okF and b and (not bar or b.bar ~= bar.bar) and holdBar(b) then
+                releaseBar(bar)
+                bar = b
+                grad = nil
+            end
+            if style == "gradient" and bar and not grad then
+                local okL, l = pcall(link, bar)
+                grad = okL and l or nil
+            end
+        end
+        if not bar then return end
+        pcall(function()
+            if style == "gradient" then
+                if not grad then return end
+                local p, n = stops(grad.g)
+                if not p then return end
+                local ph = tick() * 0.4 * speed
+                local span = rainbowGrad and 0.6 or 0.5
+                for i = 0, n - 1 do
+                    local c = gradColor(mrd("float", p + i * 20) * span - ph)
+                    for j = 1, 3 do mwr("float", p + i * 20 + j * 4, c[j]) end
+                end
+                -- White under the gradient; the frame and its inside take its
+                -- middle colour, darker, as the game does.
+                local m = gradColor(span / 2 - ph)
+                for k, f in ipairs(bar.frames) do
+                    local c = k == 1 and {1, 1, 1} or m
+                    for i = 0, 2 do mwr("float", f[1] + O.col + i * 4, c[i + 1] * f[2]) end
+                end
+                return
+            end
+            local c
+            if style == "rainbow" then
+                local col = Color3.fromHSV((tick() * 0.25 * speed) % 1, 0.8, 1)
+                c = {col.R, col.G, col.B}
+            elseif style == "health" then
+                c = byHealth(low, mid, full, fraction(bar))
+            else
+                c = fixed
+            end
+            paint(bar, c)
+        end)
+    end)
+    _G.__RSC_HPBAR_CONN = conn
+    print("[RivalsSkinChanger] Health bar: " .. (conf.label or style) .. (bar and "" or ", once the bar shows up") .. " - only you see it")
+end)
+
+-- Scope setups. Mouse.Scope._Setup picks a scope by the viewmodel's name:
+-- "Pixel Sniper" (pixel images, pixelated scaling, square dot), "Keyper"
+-- (its images at 1.25x, no turning while sliding) or "Pixel Crossbow", and
+-- the plain one otherwise. Copying images alone leaves the rest wrong, so
+-- the names it compares are pointed at the right ones instead: the target
+-- skin's check gets the name the game will see (the owned skin in swap
+-- mode, the weapon in switch mode), and an owned special skin's check gets a
+-- name no viewmodel has. Luau compares strings by pointer, so each constant
+-- is set to the game's own string (a key in ItemLibrary.ViewModels). The
+-- scope is set up when your loadout's UI is built, so it shows from your
+-- next respawn.
+pcall(function()
+    local function tstr(p)
+        if not p or p < 0x10000 then return nil end
+        local okL, len = pcall(mrd, "int", p + 20)
+        if not okL or not len or len <= 0 or len > 64 then return nil end
+        local ok, s = pcall(mrd, "string", p + STRING_DATA)
+        return ok and type(s) == "string" and s:sub(1, len) or nil
+    end
+    -- An earlier run's changes, put back when the slot and the original
+    -- string still read as they should.
+    local job = game.JobId
+    local undo = _G.__RSC_SCOPE_UNDO
+    if type(undo) == "table" and undo.job == job then
+        for _, u in ipairs(undo.list) do
+            if tstr(u[2]) == u[3] then pcall(mwr, "uintptr_t", u[1], u[2]) end
+        end
+    end
+    _G.__RSC_SCOPE_UNDO = nil
+    if not next(scopeSkins) then return end
+
+    local SPECIAL = {["Pixel Sniper"] = true, ["Keyper"] = true, ["Pixel Crossbow"] = true}
+
+    -- What the game will compare, and what each check should then match.
+    local want = {} -- special name -> name the game sees (or false: never)
+    local names = {}
+    for weapon, pick in pairs(scopeSkins) do
+        local target, owned = pick[1], pick[2]
+        local seen = owned or weapon
+        if seen ~= target then
+            if SPECIAL[target] then want[target] = seen; names[seen] = true end
+            if SPECIAL[seen] and want[seen] == nil then want[seen] = false end
+        end
+    end
+    if not next(want) then return end
+
+    local ps = LP:FindFirstChild("PlayerScripts")
+    local scope = ps
+    for _, n in ipairs({"Modules", "ClientReplicatedClasses", "ClientFighter", "ClientItem", "ItemInterface", "Mouse", "Scope"}) do
+        scope = scope and scope:FindFirstChild(n)
+    end
+    local f = nodesOf(moduleTable(scope), 64, {_Setup = true})
+    local cl = f and f._Setup and rd(f._Setup)
+    local proto = cl and cl > 0x10000 and rd(cl + 0x18)
+    -- The constants list: the offset moves between Roblox builds, so it's the
+    -- one that holds the scope names.
+    local k, slots
+    for _, off in ipairs({0x20, 0x48, 0x38, 0x28, 0x30, 0x40, 0x18, 0x50}) do
+        local arr = proto and proto > 0x10000 and rd(proto + off)
+        if arr and arr > 0x10000 then
+            local found, n = {}, 0
+            for i = 0, 47 do
+                local s = tstr(rd(arr + i * 16))
+                if s and SPECIAL[s] and not found[s] then found[s] = arr + i * 16; n = n + 1 end
+            end
+            if n >= 2 then k, slots = arr, found break end
+        end
+    end
+    if not k then
+        print("[RivalsSkinChanger] Scopes: couldn't find the scope setup on this Roblox build - only the scope images are changed")
+        return
+    end
+
+    -- The game's own strings for those names.
+    local mods = game:GetService("ReplicatedStorage"):FindFirstChild("Modules")
+    local lib = nodesOf(moduleTable(mods and mods:FindFirstChild("ItemLibrary")), 256, {ViewModels = true, ViewModelOrder = true})
+    local dict = lib and lib.ViewModels and rd(lib.ViewModels)
+    local found = dict and nodesOf(dict, 8192, names) or {}
+    local never = lib and lib.ViewModelOrder and rd(lib.ViewModelOrder + NODE_KEY)
+    local list, done = {}, {}
+    for special, seen in pairs(want) do
+        local slot = slots[special]
+        local str = seen and found[seen] and rd(found[seen] + NODE_KEY) or (seen == false and never) or nil
+        if slot and str and str > 0x10000 and (seen == false or tstr(str) == seen) then
+            local old = rd(slot)
+            list[#list + 1] = {slot, old, special}
+            mwr("uintptr_t", slot, str)
+            done[#done + 1] = seen and (special .. " scope on " .. seen) or ("plain scope on " .. special)
+        end
+    end
+    _G.__RSC_SCOPE_UNDO = #list > 0 and {job = job, list = list} or nil
+    if #done > 0 then
+        table.sort(done)
+        print("[RivalsSkinChanger] Scopes: " .. table.concat(done, ", ") .. " - from your next respawn")
+    end
+end)
+
+-- Buttons: the menu's coloured buttons (green Play and prices, blue View,
+-- yellow and gold) get their shine from a UIGradient with a fixed set of
+-- colour stops per style. Those stops are recoloured in place, in the
+-- templates under PlayerScripts too, so buttons made later come out in the
+-- new colour. [Buttons] Green/Blue/Yellow/Gold = a hex colour (shaded dark
+-- to light like the game's), two as a gradient (ff4fd8>3b5bff), sky (the
+-- sky preset's two colours) or rainbow. They stay still: Roblox draws a
+-- button's gradient once, so later changes to it never show (unlike the
+-- health bar's). Only gradients found alive in this run's scan are written:
+-- the game frees UI it rebuilds, and writing into freed memory crashes Roblox.
+pcall(function()
+    local conf = {}
+    for k, v in pairs(_G.__RSC_BTN_CFG or {}) do conf[k] = tostring(v):lower() end
+    local job = game.JobId
+    conf.speed = nil
+    -- An earlier run's colours, by gradient address, put back as those
+    -- gradients turn up in the scan below.
+    local prev = _G.__RSC_BTN_UNDO
+    prev = type(prev) == "table" and prev.job == job and prev.map or {}
+
+    local STYLES = {
+        ["74df32>7df930>c6ff0a"] = "green", ["0059ff>0673f9>00d0ff"] = "blue",
+        ["ffff00>fbf304>ebc015"] = "yellow", ["fdff72>fcfb6c>edba0e>ebb102"] = "gold",
+    }
+    local skyCols = _G.__RSC_SKY_COLORS and _G.__RSC_SKY_COLORS()
+    -- style -> {first colour, second colour or nil, rainbow = bool}
+    local want = {}
+    for _, style in pairs(STYLES) do
+        local v = conf[style]
+        if v == "rainbow" then
+            want[style] = {{1, 0, 0}, {0, 0, 1}, rainbow = true}
+        elseif v == "sky" then
+            if skyCols then
+                local a = skyCols[1]
+                local b2 = skyCols[2] or a
+                want[style] = {{a[1], a[2], a[3]}, {b2[1], b2[2], b2[3]}}
+            end
+        elseif v then
+            local h1, h2 = v:match("^%s*(#?%x+)%s*>%s*(#?%x+)%s*$")
+            local r1, g1, b1 = lightingColor(h1 or v)
+            local r2, g2, b2 = lightingColor(h2 or "")
+            if r1 then want[style] = {{r1, g1, b1}, r2 and {r2, g2, b2} or nil} end
+        end
+    end
+
+    -- One colour: dark to light across the stops, like the game's own
+    -- buttons. Two: from the first to the second.
+    local function stopColor(w2, t)
+        if w2.rainbow then
+            local h = Color3.fromHSV(t * 0.8, 0.85, 1)
+            return {h.R, h.G, h.B}
+        end
+        local c, c2 = w2[1], w2[2]
+        if c2 then
+            return {c[1] + (c2[1] - c[1]) * t, c[2] + (c2[2] - c[2]) * t, c[3] + (c2[3] - c[3]) * t}
+        end
+        local k = 0.78 + 0.22 * t
+        local w = 0.35 * t
+        return {math.min(1, c[1] * k + (1 - c[1] * k) * w), math.min(1, c[2] * k + (1 - c[2] * k) * w),
+            math.min(1, c[3] * k + (1 - c[3] * k) * w)}
+    end
+    local function stopsOf(g)
+        local p, n = rd(g + 0xf8), mrd("int", g + 0x100)
+        if p and p > 0x10000 and n and n >= 3 and n <= 4 then return p, n end
+    end
+
+    local map, count = {}, {}
+    local lp = game:GetService("Players").LocalPlayer
+    for _, root in ipairs({lp:FindFirstChild("PlayerScripts"), lp:FindFirstChild("PlayerGui")}) do
+        for _, d in ipairs(root and root:GetDescendants() or {}) do
+            if d.ClassName == "UIGradient" then
+                local g = d.Address
+                local p, n = stopsOf(g)
+                local old = prev[g]
+                if p and old and #old == n then
+                    for i, c in ipairs(old) do
+                        for j = 1, 3 do mwr("float", p + (i - 1) * 20 + j * 4, c[j]) end
+                    end
+                end
+                if p then
+                    local sig, cols = {}, {}
+                    for i = 0, n - 1 do
+                        local c = {mrd("float", p + i * 20 + 4), mrd("float", p + i * 20 + 8), mrd("float", p + i * 20 + 12)}
+                        cols[i + 1] = c
+                        sig[i + 1] = string.format("%02x%02x%02x", math.floor(c[1] * 255 + 0.5), math.floor(c[2] * 255 + 0.5), math.floor(c[3] * 255 + 0.5))
+                    end
+                    local style = STYLES[table.concat(sig, ">")]
+                    local c = style and want[style]
+                    if c then
+                        map[g] = cols
+                        for i = 0, n - 1 do
+                            local s2 = stopColor(c, i / (n - 1))
+                            for j = 1, 3 do mwr("float", p + i * 20 + j * 4, s2[j]) end
+                        end
+                        count[style] = (count[style] or 0) + 1
+                    end
+                end
+            end
+        end
+    end
+    _G.__RSC_BTN_UNDO = next(map) and {job = job, map = map} or nil
+
+    if not next(want) then
+        if next(conf) then
+            print("[RivalsSkinChanger] Buttons: no colour to use (hex like ff4fd8, ff4fd8>3b5bff, rainbow, or sky with a sky preset that has lighting) - left as they are")
+        end
+        return
+    end
+    local parts = {}
+    for _, style in ipairs({"green", "blue", "yellow", "gold"}) do
+        if count[style] then parts[#parts + 1] = style .. " " .. count[style] end
+    end
+    print("[RivalsSkinChanger] Buttons: recoloured " .. (#parts > 0 and table.concat(parts, ", ") or "none (no matching buttons found)") .. " - only you see it")
+end)
+
+-- Save state
+_G.__RIVALS_SKIN_CHANGER_STATE ={restores = memoryRestores, wfAddr = wf.Address, nameCopies = nameCopies, dicts = dictCache, floats = floatRestores}
+saveUndo()
+_G.__RIVALS_SKIN_CHANGER_BUSY = nil
+
+pcall(function()
+    local probs = _G.__RSC_PROBLEMS or {}
+    local secs = string.format("%.1fs", tick() - t_start)
+    if #probs == 0 then
+        print("[RivalsSkinChanger] Health: everything applied (" .. secs .. ")")
+        return
+    end
+    local short = {}
+    for i, m in ipairs(probs) do short[i] = #m > 110 and (m:sub(1, 107) .. "...") or m end
+    print("[RivalsSkinChanger] Health: " .. #probs .. " problem" .. (#probs == 1 and "" or "s") .. " (" .. secs .. ") - " .. table.concat(short, " | "))
+    notifyUser("Rivals Skin Changer", #probs .. " problem" .. (#probs == 1 and "" or "s") .. " - see the Health line in the console", 8)
+end)

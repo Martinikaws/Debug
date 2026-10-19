@@ -13,4 +13,6 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/Debug/ref
 
 Nothing is sent anywhere by the script. The output holds your Roblox version, the server ID, the changer's log, your config file and the state of the game's UI.
 
-`tools/make_debug.py` builds `gui.lua` from the main GUI (`RivalsSkinChangerFULLMATCHA/gui.lua`) and `tools/output_tab.lua`.
+The debug GUI runs `main.lua` from this repo: the changer with fixes still being tested, before they reach the main release.
+
+`tools/make_debug.py` builds `gui.lua` and copies `main.lua` from the main GUI and changer (`RivalsSkinChangerFULLMATCHA/gui.lua`) and `tools/output_tab.lua`.

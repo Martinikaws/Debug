@@ -17,7 +17,7 @@ local SETTINGS = "rivals_gui_settings.txt"
 local BACKUP = "rivals_config.backup.lua"
 local CACHE = "rivals_gui_cache"
 local SCRIPT_FILES = {"RivalsSkinSwapper.lua", "workspace/RivalsSkinSwapper.lua", "scripts/RivalsSkinSwapper.lua"}
-local SCRIPT_URL = "https://raw.githubusercontent.com/Martinikaws/RivalsSkinChangerFULLMATCHA/refs/heads/main/main.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/Martinikaws/Debug/refs/heads/main/main.lua"
 local SITE = "https://martinikaws.github.io/rivals-skins/"
 
 -- Debug log: everything this GUI and the changer print, kept for the

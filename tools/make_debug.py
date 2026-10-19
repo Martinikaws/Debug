@@ -54,10 +54,17 @@ def main():
 """)
     rep('    text("Skin Changer", x + 16 + textWidth("Rivals ", 16, true), y + 12, C.accent, 16, 5, true)\n',
         '    text("Skin Changer (Debug)", x + 16 + textWidth("Rivals ", 16, true), y + 12, C.accent, 16, 5, true)\n')
+    # The debug build runs the changer kept in this repo (main.lua, copied below
+    # from RivalsSkinChangerFULLMATCHA), so fixes can be tested before they
+    # reach everyone.
+    rep('local SCRIPT_URL = "https://raw.githubusercontent.com/Martinikaws/RivalsSkinChangerFULLMATCHA/refs/heads/main/main.lua"',
+        'local SCRIPT_URL = "https://raw.githubusercontent.com/Martinikaws/Debug/refs/heads/main/main.lua"')
     rep("-- The window\n", tab + "-- The window\n")
     rep('local TABS = {"Skins", "Cosmetics", "Visuals", "Misc", "Sounds", "Settings"}',
         'local TABS = {"Skins", "Cosmetics", "Visuals", "Misc", "Sounds", "Settings", "Output"}')
     rep("""    Settings = drawSettings}""", """    Settings = drawSettings, Output = drawOutput}""")
+    changer = open(os.path.join(ROOT, "..", "RivalsSkinChangerFULLMATCHA", "main.lua"), encoding="utf-8", newline="").read()
+    open(os.path.join(ROOT, "main.lua"), "w", encoding="utf-8", newline="").write(changer)
     out = os.path.join(ROOT, "gui.lua")
     open(out, "w", encoding="utf-8", newline="").write(s.replace("\n", "\r\n"))
     print("wrote", out)
