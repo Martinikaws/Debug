@@ -53,8 +53,9 @@ local function diagnostics()
         table.sort(names)
         return table.concat(names, ", ")
     end)
-    -- Name holders: an Instance's name is a pointer to a shared, counted
-    -- string. Every "Modules" should point to one holder with a sane count.
+    -- Name holders: an Instance's name is a pointer to a shared string with
+    -- a reference count at +48. Every "Modules" should point to one holder
+    -- whose count is at least the number of objects with that name.
     try("Name holders", function()
         local lp = game:GetService("Players").LocalPlayer
         local spots = {
@@ -68,12 +69,18 @@ local function diagnostics()
             local ok, inst = pcall(s[2])
             if ok and inst then
                 local holder = rdq(inst.Address + 112)
-                local h0, h1 = rdi(holder or 0), rdi((holder or 0) + 4)
-                t[#t + 1] = string.format("%s=%s holder %x [%s,%s]", s[1], tostring(inst.Name), holder or 0, tostring(h0), tostring(h1))
+                t[#t + 1] = string.format("%s=%s holder %x count %s", s[1], tostring(inst.Name), holder or 0, tostring(rdi((holder or 0) + 48)))
             else
                 t[#t + 1] = s[1] .. "=missing"
             end
         end
+        -- Fewer counts than objects named "Modules" means a teleport can free
+        -- the name while Roblox's own UI still uses it.
+        local n = 0
+        for _, root in ipairs({game, game:GetService("CoreGui")}) do
+            for _, d in ipairs(root:GetDescendants()) do if d.Name == "Modules" then n = n + 1 end end
+        end
+        t[#t + 1] = "objects named Modules: " .. n
         return table.concat(t, " ; ")
     end)
     try("PlayerGui", function()
