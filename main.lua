@@ -539,9 +539,9 @@ local function fixViewModelRoots()
                 if c.ClassName == "Part" and (c.Name == "" or c.Name == "_fake") then
                     -- The name pointer, with one more count on its holder (see copyName).
                     local holder = rd(source.Address + OFF.NameContainer)
-                    local okC, count = pcall(mrd, "int", (holder or 0) + 4)
+                    local okC, count = pcall(mrd, "int", (holder or 0) + 48)
                     if holder and holder > 0x10000 and okC and count and count >= 1 and count < 100000000 then
-                        pcall(mwr, "int", holder + 4, count + 1)
+                        pcall(mwr, "int", holder + 48, count + 1)
                         wr(c.Address + OFF.NameContainer, holder)
                     end
                     break
@@ -1394,8 +1394,9 @@ local function saveUndo()
     for _, f in ipairs(floatRestores) do out[#out + 1] = "F " .. n(f[1]) .. " " .. string.format("%.9g", f[2]) end
     pcall(writefile, UNDO_FILE, table.concat(out, "\n") .. "\n")
 end
--- A name is a pointer to a shared, counted holder (count at +4, text at
--- +8). A copied pointer gets one more count: without it, destroying the
+-- A name is a pointer to a shared, counted holder (text std::string at +8,
+-- hash at +40, reference count at +48: "MainGui" with 2 objects holds 2). A
+-- copied pointer gets one more count: without it, destroying the
 -- renamed object on a rejoin or teleport released the holder once too often,
 -- and a common name like "Modules" was freed while Roblox's own UI still used
 -- it (no top bar, menu, chat or player list, and the game's UI shifted down).
@@ -1407,14 +1408,14 @@ local function copyName(target, nameSource)
     local orig, name = rd(slot), rd(nameSource.Address + OFF.NameContainer)
     if not orig or not name or orig == 0 or name == 0 then return false end
     if orig ~= name then
-        local okC, count = pcall(mrd, "int", name + 4)
+        local okC, count = pcall(mrd, "int", name + 48)
         local okN, srcName = pcall(function() return nameSource.Name end)
         local okT, text = pcall(mrd, "string", name + 8)
         if not (okC and count and count >= 1 and count < 100000000) then return false end
         if okN and okT and type(text) == "string" and #srcName > 0 and #srcName <= 15 and text:sub(1, #srcName) ~= srcName then
             return false
         end
-        pcall(mwr, "int", name + 4, count + 1)
+        pcall(mwr, "int", name + 48, count + 1)
         table.insert(nameCopies, {slot, orig})
         wr(slot, name)
     end
