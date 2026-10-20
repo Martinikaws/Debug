@@ -1,5 +1,7 @@
 # Rivals Skin Changer - Debug
 
+**Switched off for now:** `gui.lua` only prints a note pointing to the normal loadstring. Run `tools/make_debug.py` to build the debug GUI again.
+
 The normal drawn GUI plus an **Output** tab, for bug reports.
 
 ```lua
